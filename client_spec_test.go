@@ -23,7 +23,7 @@ func TestSpec_Client_ForwardsTheRequestUnchanged(t *testing.T) {
 	req.RemoteAddr = "203.0.113.7:51234"
 	req.Header = http.Header{
 		"Content-Type":  {"application/json"},
-		"Cookie":        {"alice_agent=abc"},
+		"Cookie":        {"_vid=abc"},
 		"Authorization": {"Basic YWRtaW46c2VjcmV0"},
 		"X-Many":        {"one", "two"},
 	}
@@ -36,7 +36,7 @@ func TestSpec_Client_ForwardsTheRequestUnchanged(t *testing.T) {
 	equal(t, "header", got.Head.Header, http.Header{
 		"Host":          {"shop.example"},
 		"Content-Type":  {"application/json"},
-		"Cookie":        {"alice_agent=abc"},
+		"Cookie":        {"_vid=abc"},
 		"Authorization": {"Basic YWRtaW46c2VjcmV0"},
 		"X-Many":        {"one", "two"},
 	})
@@ -48,7 +48,7 @@ func TestSpec_Client_SpeaksTheTrapProtocol(t *testing.T) {
 	a := newArranger(t)
 	trap := a.TrapServer()
 	req := httptest.NewRequest(http.MethodGet, "/.envrc", nil)
-	req.Header.Set("Cookie", "alice_agent=abc")
+	req.Header.Set("Cookie", "_vid=abc")
 	req.Header.Set("Authorization", "Basic YWRtaW46c2VjcmV0")
 
 	a.Proxy(trap).Serve(req)
@@ -118,7 +118,7 @@ func TestSpec_Client_RelaysTheResponseUnchangedButTheMarker(t *testing.T) {
 		Status: http.StatusCreated,
 		Header: http.Header{
 			"Content-Type": {"application/json"},
-			"Set-Cookie":   {"alice_agent=abc; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax"},
+			"Set-Cookie":   {"_vid=abc; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax"},
 			"X-Many":       {"one", "two"},
 		},
 		Body:   `{"routes":["/internal/admin/payroll"]}`,
@@ -131,7 +131,7 @@ func TestSpec_Client_RelaysTheResponseUnchangedButTheMarker(t *testing.T) {
 	equal(t, "header", relayedHeader(res), http.Header{
 		"Content-Type":   {"application/json"},
 		"Content-Length": {strconv.Itoa(len(`{"routes":["/internal/admin/payroll"]}`))},
-		"Set-Cookie":     {"alice_agent=abc; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax"},
+		"Set-Cookie":     {"_vid=abc; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax"},
 		"X-Many":         {"one", "two"},
 	})
 	equal(t, "body", res.Body.String(), `{"routes":["/internal/admin/payroll"]}`)
