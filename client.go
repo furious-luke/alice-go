@@ -8,14 +8,19 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/textproto"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 )
 
 // TrapPath is the trap API's route on alice-srv.
@@ -28,6 +33,10 @@ const TrapContentType = "application/vnd.alice.trap"
 // TrapMarkerHeader is the header every response of Alice's maze carries.
 // A response without it (with the value "1") is never relayed.
 const TrapMarkerHeader = "Alice-Trap"
+
+// DefaultTimeout is how long a trap exchange may take, unless WithTimeout
+// says otherwise.
+const DefaultTimeout = 2 * time.Second
 
 // hopByHopHeaders are the headers that belong to one connection, not to the
 // request or response: they are never forwarded or relayed (RFC 9110,
@@ -45,12 +54,16 @@ var hopByHopHeaders = []string{
 }
 
 // Handler forwards every request to Alice's trap API and relays the
-// response. When Alice can't be reached, or answers without the trap
-// marker, it answers with a plain 404, as if the path weren't there.
+// response. When Alice can't be reached in time, or answers without the
+// trap marker, it answers with a plain 404, as if the path weren't there.
 type Handler struct {
-	trapURL   string
-	auth      string
-	transport http.RoundTripper
+	trapURL        string
+	key            string
+	auth           string
+	transport      http.RoundTripper
+	timeout        time.Duration
+	onError        func(*http.Request, error)
+	trustedProxies []netip.Prefix
 }
 
 // Option configures a Handler.
@@ -67,13 +80,107 @@ func WithTransport(rt http.RoundTripper) Option {
 	}
 }
 
+// WithTimeout sets the deadline of each trap exchange, DefaultTimeout
+// without it. One deadline covers the whole exchange: connecting to Alice,
+// sending the head and the forwarded body, Alice's response head and
+// relaying the response body, so a slow, large upload counts against it.
+// When it passes before the response head arrives, the handler answers its
+// plain 404. New refuses a timeout that isn't positive.
+func WithTimeout(d time.Duration) Option {
+	return func(h *Handler) {
+		h.timeout = d
+	}
+}
+
+// WithErrorHandler calls fn once each time the handler answers its
+// fail-safe 404, with the agent's request and why. The error matches
+// (errors.Is) one of ErrRequest, ErrUnreachable, ErrTimeout, ErrNoMarker
+// and ErrPanic, and is an *Error (errors.As). It never contains the API
+// key, the trap request's headers or the agent's headers. fn runs on the
+// request's goroutine, before the 404 is written; a panic in it is
+// recovered.
+func WithErrorHandler(fn func(*http.Request, error)) Option {
+	return func(h *Handler) {
+		h.onError = fn
+	}
+}
+
+// WithTrustedProxies takes the client IP from X-Forwarded-For behind the
+// site's own proxies. When the request's RemoteAddr is inside one of
+// prefixes, the handler walks X-Forwarded-For from right to left, skipping
+// addresses inside prefixes, and the first address outside them is the
+// client IP; when every entry is inside them, the leftmost is. A missing
+// header, or an entry the walk reaches that isn't an IP address, leaves
+// the client IP as RemoteAddr's. Without this option, or when RemoteAddr
+// is outside prefixes, X-Forwarded-For is ignored (it is still forwarded
+// as a header). Trusting every peer is 0.0.0.0/0 and ::/0, given
+// explicitly. New refuses an invalid prefix, and an IPv4-mapped one
+// (::ffff:10.0.0.0/104): addresses are matched in their IPv4 form, so give
+// the prefix in that form (10.0.0.0/8).
+func WithTrustedProxies(prefixes ...netip.Prefix) Option {
+	return func(h *Handler) {
+		h.trustedProxies = append(h.trustedProxies, prefixes...)
+	}
+}
+
+// The reasons the handler answers its fail-safe 404, matched with
+// errors.Is on the error WithErrorHandler gets.
+var (
+	// ErrRequest is a trap request that couldn't be made from the agent's
+	// request: its body couldn't be read, or the agent went away.
+	ErrRequest = errors.New("the trap request could not be made from the agent's request")
+	// ErrUnreachable is Alice not reached: the connection was refused, the
+	// host wasn't found, or the exchange failed before a response head.
+	ErrUnreachable = errors.New("Alice could not be reached")
+	// ErrTimeout is the deadline passing before Alice's response head.
+	ErrTimeout = errors.New("the trap request timed out")
+	// ErrNoMarker is a response from Alice without the trap marker.
+	ErrNoMarker = errors.New("Alice's response had no trap marker")
+	// ErrPanic is a panic in the handler before it had written anything.
+	ErrPanic = errors.New("the client panicked")
+)
+
+// Error is why the handler answered its fail-safe 404.
+type Error struct {
+	// Reason is one of ErrRequest, ErrUnreachable, ErrTimeout, ErrNoMarker
+	// and ErrPanic.
+	Reason error
+	// Status is Alice's status, for ErrNoMarker; 0 otherwise.
+	Status int
+	// Err is the cause, when there is one: the transport's error. It
+	// names no header of the trap request, and an error whose text
+	// carries the API key all the same is replaced by its text with the
+	// key redacted. A panic has no cause.
+	Err error
+}
+
+func (e *Error) Error() string {
+	msg := "alice client: " + e.Reason.Error()
+	if e.Status != 0 {
+		msg += fmt.Sprintf(" (status %d)", e.Status)
+	}
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg
+}
+
+// Unwrap is the reason and the cause, so errors.Is matches either.
+func (e *Error) Unwrap() []error {
+	if e.Err == nil {
+		return []error{e.Reason}
+	}
+	return []error{e.Reason, e.Err}
+}
+
 // New is a handler that forwards to the Alice server at aliceURL (for
 // example https://alice.example), authenticated by apiKey, a customer API
-// key with the trap perm. Requests reach Alice with the IP of their
-// connection, taken from the request's RemoteAddr, so mount the handler
-// where RemoteAddr is the agent's IP (with or without a port): a request
-// from a unix-socket listener, or one with no RemoteAddr, is refused by
-// Alice and answered with a 404.
+// key with the trap perm. By default, requests reach Alice with the IP of
+// their connection, taken from the request's RemoteAddr, so mount the
+// handler where RemoteAddr is the agent's IP (with or without a port), or
+// list the site's proxies with WithTrustedProxies: a request from a
+// unix-socket listener, or one with no RemoteAddr, is refused by Alice and
+// answered with a 404.
 func New(aliceURL, apiKey string, opts ...Option) (*Handler, error) {
 	base, err := url.Parse(aliceURL)
 	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
@@ -88,11 +195,27 @@ func New(aliceURL, apiKey string, opts ...Option) (*Handler, error) {
 	}
 	h := &Handler{
 		trapURL:   base.JoinPath(TrapPath).String(),
+		key:       apiKey,
 		auth:      "Token " + apiKey,
 		transport: http.DefaultTransport,
+		timeout:   DefaultTimeout,
 	}
 	for _, opt := range opts {
 		opt(h)
+	}
+	if h.timeout <= 0 {
+		return nil, errors.New("alice client: the timeout must be positive")
+	}
+	for i, p := range h.trustedProxies {
+		if !p.IsValid() {
+			return nil, errors.New("alice client: a trusted proxy prefix is invalid")
+		}
+		if p.Addr().Is4In6() {
+			// Addresses are unmapped before they are matched, so a mapped
+			// prefix would never match anything.
+			return nil, fmt.Errorf("alice client: the trusted proxy prefix %s is IPv4-mapped; use its IPv4 form", p)
+		}
+		h.trustedProxies[i] = p.Masked()
 	}
 	return h, nil
 }
@@ -106,16 +229,31 @@ type trapHead struct {
 	ClientIP string      `json:"client_ip"`
 }
 
-// ServeHTTP forwards r to the trap API and relays the response.
+// ServeHTTP forwards r to the trap API and relays the response. No panic
+// leaves it: one before anything is written is answered with the 404.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	trapReq, err := h.trapRequest(r)
+	tw := &trackingWriter{ResponseWriter: w}
+	defer func() {
+		if v := recover(); v != nil && !tw.wrote {
+			// The panic's value is left out: it could be anything, the
+			// trap request and its key included.
+			h.failSafe(tw, r, &Error{Reason: ErrPanic})
+		}
+	}()
+	h.serve(tw, r)
+}
+
+func (h *Handler) serve(w *trackingWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
+	defer cancel()
+	trapReq, body, err := h.trapRequest(ctx, r)
 	if err != nil {
-		http.NotFound(w, r)
+		h.failSafe(w, r, &Error{Reason: ErrRequest, Err: err})
 		return
 	}
 	res, err := h.transport.RoundTrip(trapReq)
 	if err != nil {
-		http.NotFound(w, r)
+		h.failSafe(w, r, &Error{Reason: h.roundTripReason(ctx, r, body, err), Err: err})
 		return
 	}
 	defer res.Body.Close()
@@ -123,7 +261,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Drain a little so the connection can be reused; the rest is
 		// discarded with it.
 		_, _ = io.CopyN(io.Discard, res.Body, 4<<10)
-		http.NotFound(w, r)
+		h.failSafe(w, r, &Error{Reason: ErrNoMarker, Status: res.StatusCode})
 		return
 	}
 
@@ -133,14 +271,133 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	header.Del(TrapMarkerHeader)
 	w.WriteHeader(res.StatusCode)
-	// A failure here is past the point where the agent could be told
-	// anything else: the status is already sent.
+	// A failure here (the deadline included) is past the point where the
+	// agent could be told anything else: the status is already sent.
 	_, _ = io.Copy(w, res.Body)
 }
 
-// trapRequest is the trap request for the forwarded request r: its head
-// line, then r's body, streamed.
-func (h *Handler) trapRequest(r *http.Request) (*http.Request, error) {
+// roundTripReason is why the trap request failed with err: the agent's
+// request ending or its body failing, the deadline, or Alice not reached.
+func (h *Handler) roundTripReason(ctx context.Context, r *http.Request, body *agentBody, err error) error {
+	switch {
+	case r.Context().Err() != nil, body.failed():
+		return ErrRequest
+	case errors.Is(ctx.Err(), context.DeadlineExceeded), errors.Is(err, context.DeadlineExceeded):
+		return ErrTimeout
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return ErrTimeout
+	}
+	return ErrUnreachable
+}
+
+// failSafe answers the plain 404, after telling the error handler why.
+func (h *Handler) failSafe(w http.ResponseWriter, r *http.Request, err *Error) {
+	if err.Err != nil && strings.Contains(err.Err.Error(), h.key) {
+		// The default transport's errors never carry the key; a custom
+		// transport's might.
+		err.Err = errors.New(strings.ReplaceAll(err.Err.Error(), h.key, "[redacted]"))
+	}
+	h.report(r, err)
+	http.NotFound(w, r)
+}
+
+// report calls the error handler, if there is one; a panic in it is
+// recovered, so the 404 is still written.
+func (h *Handler) report(r *http.Request, err error) {
+	if h.onError == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	h.onError(r, err)
+}
+
+// trackingWriter records whether anything has been written to the agent.
+type trackingWriter struct {
+	http.ResponseWriter
+	wrote bool
+}
+
+func (w *trackingWriter) WriteHeader(status int) {
+	w.wrote = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *trackingWriter) Write(p []byte) (int, error) {
+	w.wrote = true
+	return w.ResponseWriter.Write(p)
+}
+
+// agentBody is the agent's body as the trap request reads it. A goroutine
+// copies the agent's body into a pipe the transport reads, so when the
+// exchange ends (the deadline included) the pipe is closed and the
+// transport stops waiting on an agent that has stopped sending: Go's
+// transport doesn't return from a failed round trip until it is done
+// with the request body. It also records whether a read of the agent's
+// body failed, so that failure isn't taken for Alice's.
+type agentBody struct {
+	pr *io.PipeReader
+
+	mu  sync.Mutex
+	err error
+}
+
+// newAgentBody starts copying body, until it ends or ctx is done.
+func newAgentBody(ctx context.Context, body io.Reader) *agentBody {
+	pr, pw := io.Pipe()
+	b := &agentBody{pr: pr}
+	context.AfterFunc(ctx, func() { pr.CloseWithError(ctx.Err()) })
+	// The copy can outlive the handler: closing the pipe ends the trap
+	// request, but a read of the agent's body already blocked goes on until
+	// it returns. That relies on the standard library's server, which locks
+	// the body so its Close waits for that read and later reads fail, and
+	// whose ReadTimeout bounds a read from an agent that stopped sending.
+	go func() {
+		defer func() {
+			if v := recover(); v != nil {
+				// The panic's value is left out, as in ServeHTTP.
+				err := errors.New("alice client: reading the agent's body panicked")
+				b.mu.Lock()
+				b.err = err
+				b.mu.Unlock()
+				pw.CloseWithError(err)
+			}
+		}()
+		_, err := io.Copy(pw, readerFunc(func(p []byte) (int, error) {
+			n, err := body.Read(p)
+			if err != nil && err != io.EOF {
+				b.mu.Lock()
+				b.err = err
+				b.mu.Unlock()
+			}
+			return n, err
+		}))
+		pw.CloseWithError(err)
+	}()
+	return b
+}
+
+func (b *agentBody) Read(p []byte) (int, error) { return b.pr.Read(p) }
+
+// failed is whether a read of the agent's body failed.
+func (b *agentBody) failed() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.err != nil
+}
+
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
+
+// trapRequest is the trap request for the forwarded request r, bound to
+// ctx: its head line, then r's body, streamed; body is r's body as it
+// reads it, nil for a request without one.
+func (h *Handler) trapRequest(ctx context.Context, r *http.Request) (trapReq *http.Request, body *agentBody, err error) {
 	header := withoutHopByHop(r.Header)
 	if r.Host != "" {
 		header.Set("Host", r.Host)
@@ -149,20 +406,21 @@ func (h *Handler) trapRequest(r *http.Request) (*http.Request, error) {
 		Method:   r.Method,
 		Target:   requestTarget(r),
 		Header:   header,
-		ClientIP: clientIP(r.RemoteAddr),
+		ClientIP: h.clientIP(r),
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	head = append(head, '\n')
 
-	var body io.Reader = bytes.NewReader(head)
+	var content io.Reader = bytes.NewReader(head)
 	if r.Body != nil && r.Body != http.NoBody {
-		body = io.MultiReader(body, r.Body)
+		body = newAgentBody(ctx, r.Body)
+		content = io.MultiReader(content, body)
 	}
-	trapReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, h.trapURL, body)
+	trapReq, err = http.NewRequestWithContext(ctx, http.MethodPost, h.trapURL, content)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if r.Body == nil || r.Body == http.NoBody {
 		trapReq.ContentLength = int64(len(head))
@@ -175,7 +433,7 @@ func (h *Handler) trapRequest(r *http.Request) (*http.Request, error) {
 	}
 	trapReq.Header.Set("Authorization", h.auth)
 	trapReq.Header.Set("Content-Type", TrapContentType)
-	return trapReq, nil
+	return trapReq, body, nil
 }
 
 // requestTarget is the path and query the agent asked for: the request URI
@@ -190,9 +448,68 @@ func requestTarget(r *http.Request) string {
 	return r.URL.RequestURI()
 }
 
-// clientIP is the IP of the agent's connection: RemoteAddr without its
+// clientIP is the agent's IP: RemoteAddr's, or, when RemoteAddr is a
+// trusted proxy, the one X-Forwarded-For gives.
+func (h *Handler) clientIP(r *http.Request) string {
+	remote := remoteIP(r.RemoteAddr)
+	if len(h.trustedProxies) == 0 {
+		return remote
+	}
+	peer, err := netip.ParseAddr(remote)
+	if err != nil || !h.trusted(peer.Unmap().WithZone("")) {
+		return remote
+	}
+	if forwarded, ok := h.forwardedFor(r.Header.Values("X-Forwarded-For")); ok {
+		return forwarded.String()
+	}
+	return remote
+}
+
+// forwardedFor walks the X-Forwarded-For lines from the right, skipping
+// trusted addresses, and is the first untrusted one, or the leftmost when
+// all are trusted. It is false when there is no entry, or the walk reaches
+// one that isn't an IP address. Entries left of the result are never read.
+func (h *Handler) forwardedFor(lines []string) (netip.Addr, bool) {
+	var last netip.Addr
+	for i := len(lines) - 1; i >= 0; i-- {
+		rest := lines[i]
+		for {
+			entry := rest
+			cut := strings.LastIndexByte(rest, ',')
+			if cut >= 0 {
+				entry, rest = rest[cut+1:], rest[:cut]
+			}
+			addr, err := netip.ParseAddr(textproto.TrimString(entry))
+			if err != nil {
+				return netip.Addr{}, false
+			}
+			addr = addr.Unmap().WithZone("")
+			if !h.trusted(addr) {
+				return addr, true
+			}
+			last = addr
+			if cut < 0 {
+				break
+			}
+		}
+	}
+	return last, last.IsValid()
+}
+
+// trusted is whether addr, unmapped and without a zone, is inside a
+// trusted proxy prefix.
+func (h *Handler) trusted(addr netip.Addr) bool {
+	for _, p := range h.trustedProxies {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// remoteIP is the IP of the agent's connection: RemoteAddr without its
 // port.
-func clientIP(remoteAddr string) string {
+func remoteIP(remoteAddr string) string {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
 		return remoteAddr

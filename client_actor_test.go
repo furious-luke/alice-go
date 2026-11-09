@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -18,6 +19,49 @@ import (
 type proxyActor struct {
 	t       *testing.T
 	handler http.Handler
+
+	mu sync.Mutex
+	// reported is what the error handler was called with, for a proxy
+	// made with one.
+	reported []reported
+}
+
+// reported is one call of the error handler.
+type reported struct {
+	Path string
+	Err  error
+}
+
+func (p *proxyActor) record(r *http.Request, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reported = append(p.reported, reported{Path: r.URL.Path, Err: err})
+}
+
+// Reported is every call of the error handler so far.
+func (p *proxyActor) Reported() []reported {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]reported(nil), p.reported...)
+}
+
+// MustReportOnce is the one error the error handler was called with; it
+// fails the spec unless there was exactly one call.
+func (p *proxyActor) MustReportOnce() error {
+	p.t.Helper()
+	got := p.Reported()
+	if len(got) != 1 {
+		p.t.Fatalf("the error handler was called %d times, want once: %v", len(got), got)
+	}
+	return got[0].Err
+}
+
+// TimedServe is Serve, and how long the handler took.
+func (p *proxyActor) TimedServe(req *http.Request) (*httptest.ResponseRecorder, time.Duration) {
+	p.t.Helper()
+	start := time.Now()
+	res := p.Serve(req)
+	return res, time.Since(start)
 }
 
 // Serve hands req to the handler and returns what the agent would get. A
@@ -185,5 +229,57 @@ func atLeast(t *testing.T, what string, got, min int64) {
 	t.Helper()
 	if got < min {
 		t.Errorf("%s: got %d, want at least %d", what, got, min)
+	}
+}
+
+// roundTripFunc is an http.RoundTripper made of a function.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// panickingTransport panics on every trap request.
+var panickingTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+	panic("the transport broke")
+})
+
+// leakyTransport fails every trap request with an error that quotes the
+// trap request's Authorization header, as a careless custom transport
+// might.
+var leakyTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("refused request with %s", r.Header.Get("Authorization"))
+})
+
+// relayedBeforeThePanic is what panickingBodyTransport's body gives before
+// it panics.
+const relayedBeforeThePanic = "the start of the maze"
+
+// panickingBodyTransport answers every trap request with the trap marker
+// and a body that gives relayedBeforeThePanic, then panics when it is read
+// again.
+var panickingBodyTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Alice-Trap": {"1"}},
+		Body:       io.NopCloser(&panickingReader{before: relayedBeforeThePanic}),
+	}, nil
+})
+
+// panickingReader gives before, then panics on the next read.
+type panickingReader struct{ before string }
+
+func (r *panickingReader) Read(p []byte) (int, error) {
+	if r.before == "" {
+		panic("the body broke")
+	}
+	n := copy(p, r.before)
+	r.before = r.before[n:]
+	return n, nil
+}
+
+// atMost fails the spec unless got is at most max.
+func atMost(t *testing.T, what string, got, max int64) {
+	t.Helper()
+	if got > max {
+		t.Errorf("%s: got %d, want at most %d", what, got, max)
 	}
 }

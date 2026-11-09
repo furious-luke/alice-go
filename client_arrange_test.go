@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -22,11 +23,18 @@ type arranger interface {
 	TrapServer() *fakeTrap
 	// Proxy is the client's handler, forwarding to trap.
 	Proxy(trap *fakeTrap) *proxyActor
-	// ProxyTo is the client's handler, forwarding to the Alice server at
-	// aliceURL.
-	ProxyTo(aliceURL string) *proxyActor
+	// ProxyTo is the client's handler made with opts, forwarding to the
+	// Alice server at aliceURL.
+	ProxyTo(aliceURL string, opts ...client.Option) *proxyActor
+	// ReportingProxy is the client's handler made with opts, forwarding to
+	// the Alice server at aliceURL, with an error handler that records
+	// every error it is called with.
+	ReportingProxy(aliceURL string, opts ...client.Option) *proxyActor
 	// UnreachableAlice is the URL of an Alice server that is not listening.
 	UnreachableAlice() string
+	// HungAlice is the URL of an Alice server that accepts connections and
+	// never answers, as a paused one does.
+	HungAlice() string
 	// Agent is an agent that reaches the proxy over the network.
 	Agent(proxy *proxyActor) *agentActor
 }
@@ -57,13 +65,58 @@ func (a *defaultArranger) Proxy(trap *fakeTrap) *proxyActor {
 	return a.ProxyTo(trap.server.URL)
 }
 
-func (a *defaultArranger) ProxyTo(aliceURL string) *proxyActor {
+func (a *defaultArranger) ProxyTo(aliceURL string, opts ...client.Option) *proxyActor {
 	a.t.Helper()
-	h, err := client.New(aliceURL, testAPIKey)
+	h, err := client.New(aliceURL, testAPIKey, opts...)
 	if err != nil {
 		a.t.Fatalf("client.New(%q): %v", aliceURL, err)
 	}
 	return &proxyActor{t: a.t, handler: h}
+}
+
+func (a *defaultArranger) ReportingProxy(aliceURL string, opts ...client.Option) *proxyActor {
+	a.t.Helper()
+	p := &proxyActor{t: a.t}
+	opts = append(opts, client.WithErrorHandler(p.record))
+	h, err := client.New(aliceURL, testAPIKey, opts...)
+	if err != nil {
+		a.t.Fatalf("client.New(%q): %v", aliceURL, err)
+	}
+	p.handler = h
+	return p
+}
+
+func (a *defaultArranger) HungAlice() string {
+	a.t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		a.t.Fatalf("listen: %v", err)
+	}
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Held open, never read or answered.
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	a.t.Cleanup(func() {
+		ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	})
+	return "http://" + ln.Addr().String()
 }
 
 func (a *defaultArranger) UnreachableAlice() string {
