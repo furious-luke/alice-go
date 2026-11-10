@@ -21,10 +21,26 @@ if err != nil {
 
 mux := http.NewServeMux()
 mux.Handle("/.envrc", trap)
+mux.Handle("/.env", trap)
+mux.Handle("/.env.local", trap)
+mux.Handle("/.env.production", trap)
 mux.Handle("/internal/admin", trap)
 mux.Handle("/internal/admin/", trap)
 mux.HandleFunc("GET /api/products", products) // the site's real routes
 ```
+
+These are the bait paths, and Alice answers each of them:
+
+| Path | Alice's answer |
+| --- | --- |
+| `/.envrc` | A direnv file (`export KEY=value` lines) leaking the fake admin's URL and a password of the agent's own. |
+| `/.env`, `/.env.local`, `/.env.production` | The same values as a dotenv file (`KEY=value` lines), the same password included. |
+| `/internal/admin`, `/internal/admin/` and below | The fake admin, behind the leaked password. |
+
+Mount only the ones your site doesn't serve itself: a path you serve for
+real stays yours, and a path you don't mount just isn't bait. The admin
+needs both `/internal/admin` and `/internal/admin/`, so a bait file's
+password leads somewhere.
 
 The API key is a customer key with the `trap` perm (`alice key make` prints
 one). `New` refuses a URL that isn't `http` or `https` with a host, and an
@@ -39,6 +55,7 @@ empty key.
 | `WithDroppedCookies(names...)` | none | Takes the named cookies out of what is forwarded: your own session, CSRF and remember-me cookies ([below](#your-own-cookies-and-headers)). `New` refuses an empty or invalid name, and `_vid`, Alice's agent cookie. |
 | `WithDroppedHeaders(names...)` | none | Takes the named headers out of what is forwarded, in any case: identity headers your own proxy adds. `New` refuses an empty or invalid name, and `Authorization`, `Cookie` and `Host`. |
 | `WithTrustedProxies(prefixes...)` | none | Takes the client IP from `X-Forwarded-For` behind your own proxies. `New` refuses an invalid prefix, and an IPv4-mapped one (give `10.0.0.0/8`, not `::ffff:10.0.0.0/104`). |
+| `WithClientIP(fn)` | none | Takes the client IP from your own code, `fn(r)`, for each request ([below](#client-ip-from-your-own-code)). `New` refuses a nil `fn`, and `WithClientIP` together with `WithTrustedProxies`, even one with no prefixes. |
 | `WithTransport(rt)` | `http.DefaultTransport` | Sends the trap requests through your own `http.RoundTripper`. |
 
 ```go
@@ -79,6 +96,49 @@ client takes them out before anything is forwarded:
 
 Either option can be given more than once; the lists add up. The agent's
 request itself is never changed, so the error handler sees it as received.
+
+### Client IP from your own code
+
+If your site already works out the client IP, hand it to the client with
+`WithClientIP` instead of listing proxies: behind load balancers with no
+fixed addresses, say, where you count hops from the right of
+`X-Forwarded-For`. The function is called once for each request, on the
+request's goroutine, before the trap request is sent:
+
+```go
+// trustedHops is how many proxies of yours append to X-Forwarded-For.
+const trustedHops = 2
+
+clientIP := func(r *http.Request) string {
+	var entries []string
+	for _, line := range r.Header.Values("X-Forwarded-For") {
+		for _, entry := range strings.Split(line, ",") {
+			entries = append(entries, strings.TrimSpace(entry))
+		}
+	}
+	if len(entries) < trustedHops {
+		return "" // RemoteAddr's IP
+	}
+	return entries[len(entries)-trustedHops] // the Nth entry from the right
+}
+
+trap, err := aliceclient.New(aliceURL, apiKey, aliceclient.WithClientIP(clientIP))
+```
+
+- **What it may return:** an IP address (`198.51.100.9`), or an address and
+  port (`198.51.100.9:4711`, `[2001:db8::1]:443`), whose port is dropped.
+  An IPv4-mapped address is sent in its IPv4 form, and a zone
+  (`fe80::1%eth0`) is dropped.
+- **Falling back:** when the function returns `""`, something that isn't
+  one of those, or panics (the panic is recovered), the client IP is
+  `RemoteAddr`'s, as without the option. The request is still forwarded and
+  the agent still gets Alice's answer, not the fail-safe 404: a bug in your
+  function costs Alice a better IP, never a capture. The fallback is silent:
+  nothing is reported to `WithErrorHandler`, so test your function, or a
+  load balancer's IP becomes every agent's.
+- **Refused:** `New` refuses a nil function, and `WithClientIP` together
+  with `WithTrustedProxies`, in either order, even when `WithTrustedProxies`
+  is given no prefixes. Give the client IP one way.
 
 ### The timeout
 
@@ -135,10 +195,11 @@ aliceclient.WithTrustedProxies(netip.MustParsePrefix("0.0.0.0/0"), netip.MustPar
   (the `Host` header included; hop-by-hop headers, and the cookies and
   headers you drop, left out), the body,
   streamed, and the client IP, taken from the connection's `RemoteAddr`
-  (or from `X-Forwarded-For` behind trusted proxies, above). Mount the
-  handler where `RemoteAddr` is the agent's IP (with or without a port) or
-  a listed proxy's: Alice refuses a request without an IP, such as one from
-  a unix-socket listener, and the handler answers it with a 404.
+  (or from `X-Forwarded-For` behind trusted proxies, or from your own code,
+  above). Mount the handler where `RemoteAddr` is the agent's IP (with or
+  without a port) or a listed proxy's, or give the IP with `WithClientIP`:
+  Alice refuses a request without an IP, such as one from a unix-socket
+  listener, and the handler answers it with a 404.
 - **Relayed:** the status (4xx and 5xx included), headers and body of
   Alice's response, without the trap marker (`Alice-Trap`) or hop-by-hop
   headers. Redirects are relayed, not followed.

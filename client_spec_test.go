@@ -824,3 +824,139 @@ func TestSpec_Client_RefusesABadDrop(t *testing.T) {
 		})
 	}
 }
+
+// With WithClientIP, the client IP is the one the site's function gives,
+// as an address or an address and port, unmapped and without a zone,
+// whatever RemoteAddr and X-Forwarded-For say. X-Forwarded-For is still
+// forwarded as a header.
+func TestSpec_Client_TakesTheClientIPFromTheSitesFunction(t *testing.T) {
+	cases := []struct {
+		name  string
+		given string
+		want  string
+	}{
+		{"an IPv4 address", "198.51.100.9", "198.51.100.9"},
+		{"an IPv4 address and port", "198.51.100.9:4711", "198.51.100.9"},
+		{"an IPv6 address and port", "[2001:db8::1]:443", "2001:db8::1"},
+		{"an IPv6 address", "2001:db8::1", "2001:db8::1"},
+		{"an IPv4-mapped address", "::ffff:198.51.100.9", "198.51.100.9"},
+		{"an IPv4-mapped address and port", "[::ffff:198.51.100.9]:80", "198.51.100.9"},
+		{"an address with a zone", "fe80::1%eth0", "fe80::1"},
+		{"an address with a zone and port", "[fe80::1%eth0]:443", "fe80::1"},
+		{"an address with spaces around it", " 198.51.100.9 ", "198.51.100.9"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newArranger(t)
+			trap := a.TrapServer()
+			req := httptest.NewRequest(http.MethodGet, "/.env", nil)
+			req.RemoteAddr = "10.0.0.1:5000"
+			req.Header.Set("X-Forwarded-For", "203.0.113.7")
+			proxy := a.ReportingProxy(trap.server.URL, client.WithClientIP(func(*http.Request) string { return tc.given }))
+
+			res := proxy.Serve(req)
+
+			got := trap.MustLastRequest().Head
+			equal(t, "status", res.Code, http.StatusOK)
+			equal(t, "client IP", got.ClientIP, tc.want)
+			equal(t, "forwarded header", got.Header["X-Forwarded-For"], []string{"203.0.113.7"})
+			equal(t, "reports", len(proxy.Reported()), 0)
+		})
+	}
+}
+
+// The site's function is called once for each request, with the agent's
+// request.
+func TestSpec_Client_CallsTheClientIPFunctionOncePerRequest(t *testing.T) {
+	a := newArranger(t)
+	trap := a.TrapServer()
+	var seen []string
+	proxy := a.ProxyTo(trap.server.URL, client.WithClientIP(func(r *http.Request) string {
+		seen = append(seen, r.URL.Path)
+		return r.Header.Get("X-Site-Client")
+	}))
+	for _, ip := range []string{"198.51.100.1", "198.51.100.2"} {
+		req := httptest.NewRequest(http.MethodGet, "/.env", nil)
+		req.Header.Set("X-Site-Client", ip)
+		proxy.Serve(req)
+	}
+
+	requests := trap.Requests()
+	equal(t, "calls", seen, []string{"/.env", "/.env"})
+	equal(t, "trap requests", len(requests), 2)
+	equal(t, "first client IP", requests[0].Head.ClientIP, "198.51.100.1")
+	equal(t, "second client IP", requests[1].Head.ClientIP, "198.51.100.2")
+}
+
+// When the site's function gives nothing usable, or panics, the client IP
+// is RemoteAddr's, as without the option: the request is still forwarded,
+// Alice's answer is relayed and no error is reported.
+func TestSpec_Client_FallsBackToRemoteAddrWhenTheClientIPFunctionFails(t *testing.T) {
+	returning := func(s string) func(*http.Request) string { return func(*http.Request) string { return s } }
+	cases := []struct {
+		name string
+		fn   func(*http.Request) string
+	}{
+		{"an empty result", returning("")},
+		{"only spaces", returning("  ")},
+		{"not an IP", returning("not-an-ip")},
+		{"a host name and port", returning("shop.example:443")},
+		{"an empty port", returning("198.51.100.9:")},
+		{"a port out of range", returning("198.51.100.9:99999")},
+		{"a bracketed address without a port", returning("[2001:db8::1]")},
+		{"a list", returning("198.51.100.9, 203.0.113.8")},
+		{"a panic", func(*http.Request) string { panic("the site's code broke") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newArranger(t)
+			trap := a.TrapServer()
+			trap.AnswersWith(trapResponse{Status: http.StatusOK, Body: "bait", Marker: "1"})
+			req := httptest.NewRequest(http.MethodGet, "/.env", nil)
+			req.RemoteAddr = "203.0.113.7:51234"
+			req.Header.Set("X-Forwarded-For", "198.51.100.50")
+			proxy := a.ReportingProxy(trap.server.URL, client.WithClientIP(tc.fn))
+
+			res := proxy.Serve(req)
+
+			equal(t, "status", res.Code, http.StatusOK)
+			equal(t, "body", res.Body.String(), "bait")
+			equal(t, "client IP", trap.MustLastRequest().Head.ClientIP, "203.0.113.7")
+			equal(t, "reports", len(proxy.Reported()), 0)
+		})
+	}
+}
+
+// New refuses a nil client-IP function, and WithClientIP together with
+// WithTrustedProxies, in either order and even with no prefixes, with an
+// error naming the problem.
+func TestSpec_Client_RefusesABadClientIPOption(t *testing.T) {
+	fn := func(*http.Request) string { return "198.51.100.9" }
+	proxies := client.WithTrustedProxies(netip.MustParsePrefix("10.0.0.0/8"))
+	both := "WithClientIP and WithTrustedProxies can't be given together"
+	cases := []struct {
+		name string
+		opts []client.Option
+		says string
+	}{
+		{"a nil function", []client.Option{client.WithClientIP(nil)}, "WithClientIP's function is nil"},
+		{"WithClientIP then WithTrustedProxies", []client.Option{client.WithClientIP(fn), proxies}, both},
+		{"WithTrustedProxies then WithClientIP", []client.Option{proxies, client.WithClientIP(fn)}, both},
+		{"WithClientIP and an empty WithTrustedProxies", []client.Option{client.WithTrustedProxies(), client.WithClientIP(fn)}, both},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := client.New("https://alice.example", testAPIKey, tc.opts...)
+
+			if err == nil {
+				t.Fatal("not refused")
+			}
+			equal(t, "error says "+tc.says, strings.Contains(err.Error(), tc.says), true)
+		})
+	}
+
+	t.Run("the control: WithClientIP alone", func(t *testing.T) {
+		_, err := client.New("https://alice.example", testAPIKey, client.WithClientIP(fn))
+		equal(t, "error", err, nil)
+	})
+}

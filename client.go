@@ -69,6 +69,12 @@ type Handler struct {
 	timeout        time.Duration
 	onError        func(*http.Request, error)
 	trustedProxies []netip.Prefix
+	// trustsProxies and hasClientIP are whether WithTrustedProxies and
+	// WithClientIP were given, so New can refuse both together even when
+	// the prefixes are none or the function is nil.
+	trustsProxies bool
+	hasClientIP   bool
+	clientIPFunc  func(*http.Request) string
 	// cookiesToDrop and headersToDrop are the names the options give, as
 	// given; droppedCookies and droppedHeaders are them checked by New, the
 	// header names in canonical form.
@@ -131,7 +137,26 @@ func WithErrorHandler(fn func(*http.Request, error)) Option {
 // the prefix in that form (10.0.0.0/8).
 func WithTrustedProxies(prefixes ...netip.Prefix) Option {
 	return func(h *Handler) {
+		h.trustsProxies = true
 		h.trustedProxies = append(h.trustedProxies, prefixes...)
+	}
+}
+
+// WithClientIP takes the client IP from fn, the site's own code: for a
+// site that already works it out, behind load balancers with no fixed
+// addresses, say. fn is called once per request, on the request's
+// goroutine, before the trap request is sent. Its result is an IP address,
+// or an IP address and port (198.51.100.9:4711, [2001:db8::1]:443), whose
+// port is dropped; an IPv4-mapped address is given in its IPv4 form, and
+// a zone is dropped. When fn returns "" or something else that isn't one
+// of those, or panics (the panic is recovered), the client IP is
+// RemoteAddr's, as without the option, and the request is forwarded all
+// the same. New refuses a nil fn, and WithClientIP together with
+// WithTrustedProxies: give the client IP one way.
+func WithClientIP(fn func(*http.Request) string) Option {
+	return func(h *Handler) {
+		h.hasClientIP = true
+		h.clientIPFunc = fn
 	}
 }
 
@@ -226,10 +251,11 @@ func (e *Error) Unwrap() []error {
 // example https://alice.example), authenticated by apiKey, a customer API
 // key with the trap perm. By default, requests reach Alice with the IP of
 // their connection, taken from the request's RemoteAddr, so mount the
-// handler where RemoteAddr is the agent's IP (with or without a port), or
-// list the site's proxies with WithTrustedProxies: a request from a
-// unix-socket listener, or one with no RemoteAddr, is refused by Alice and
-// answered with a 404.
+// handler where RemoteAddr is the agent's IP (with or without a port),
+// list the site's proxies with WithTrustedProxies, or give the IP from the
+// site's own code with WithClientIP: a request from a unix-socket listener,
+// or one with no RemoteAddr and no IP from WithClientIP, is refused by
+// Alice and answered with a 404.
 func New(aliceURL, apiKey string, opts ...Option) (*Handler, error) {
 	base, err := url.Parse(aliceURL)
 	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
@@ -254,6 +280,12 @@ func New(aliceURL, apiKey string, opts ...Option) (*Handler, error) {
 	}
 	if h.timeout <= 0 {
 		return nil, errors.New("alice client: the timeout must be positive")
+	}
+	if h.hasClientIP && h.clientIPFunc == nil {
+		return nil, errors.New("alice client: WithClientIP's function is nil")
+	}
+	if h.hasClientIP && h.trustsProxies {
+		return nil, errors.New("alice client: WithClientIP and WithTrustedProxies can't be given together: give the client IP one way")
 	}
 	for i, p := range h.trustedProxies {
 		if !p.IsValid() {
@@ -562,10 +594,17 @@ func requestTarget(r *http.Request) string {
 	return r.URL.RequestURI()
 }
 
-// clientIP is the agent's IP: RemoteAddr's, or, when RemoteAddr is a
-// trusted proxy, the one X-Forwarded-For gives.
+// clientIP is the agent's IP: the one the site's function gives, or
+// RemoteAddr's, or, when RemoteAddr is a trusted proxy, the one
+// X-Forwarded-For gives.
 func (h *Handler) clientIP(r *http.Request) string {
 	remote := remoteIP(r.RemoteAddr)
+	if h.clientIPFunc != nil {
+		if addr, ok := h.siteClientIP(r); ok {
+			return addr.String()
+		}
+		return remote
+	}
 	if len(h.trustedProxies) == 0 {
 		return remote
 	}
@@ -577,6 +616,30 @@ func (h *Handler) clientIP(r *http.Request) string {
 		return forwarded.String()
 	}
 	return remote
+}
+
+// siteClientIP is the client IP the site's function gives for r,
+// unmapped and without a zone, and false when it gives nothing usable or
+// panics. The panic is recovered here, so the request is still trapped.
+func (h *Handler) siteClientIP(r *http.Request) (addr netip.Addr, ok bool) {
+	defer func() {
+		if recover() != nil {
+			addr, ok = netip.Addr{}, false
+		}
+	}()
+	s := textproto.TrimString(h.clientIPFunc(r))
+	if s == "" {
+		return netip.Addr{}, false
+	}
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		addrPort, err := netip.ParseAddrPort(s)
+		if err != nil {
+			return netip.Addr{}, false
+		}
+		addr = addrPort.Addr()
+	}
+	return addr.Unmap().WithZone(""), true
 }
 
 // forwardedFor walks the X-Forwarded-For lines from the right, skipping
