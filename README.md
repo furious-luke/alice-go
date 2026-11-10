@@ -21,11 +21,11 @@ from it to [github.com/furious-luke/alice-go](https://github.com/furious-luke/al
 (see "Releasing the client" in Alice's README). Make changes in the
 monorepo, not in the public repo: a release pushes `alice/client`'s own
 history, split out of the monorepo, so a commit made only in the public
-repo would be overwritten or block the next release.
-
-Design: the trap protocol and what the client does with it are in Alice's
-`designs/trap.md`, in the monorepo ([../designs/trap.md](../designs/trap.md)
-from there).
+repo would be overwritten or block the next release. The trap protocol and
+what the client does with it are in Alice's `designs/trap.md`
+([../designs/trap.md](../designs/trap.md) from `alice/client`). In the
+monorepo, `../../scripts/dev-checks.sh check alice/client` runs the vet,
+test and gofmt checks CI runs.
 
 ## Mounting it
 
@@ -230,7 +230,6 @@ aliceclient.WithTrustedProxies(netip.MustParsePrefix("0.0.0.0/0"), netip.MustPar
 
 ```sh
 go test ./...
-../../scripts/dev-checks.sh check alice/client   # vet, test and gofmt, as CI runs them
 ```
 
 The tests run against a fake trap server; they need no network or Docker.
