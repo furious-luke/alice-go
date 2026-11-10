@@ -32,7 +32,7 @@ test and gofmt checks CI runs.
 ```go
 import aliceclient "github.com/furious-luke/alice-go"
 
-trap, err := aliceclient.New("https://alice.example", os.Getenv("ALICE_API_KEY"))
+trap, err := aliceclient.New(os.Getenv("ALICE_API_KEY"))
 if err != nil {
 	log.Fatal(err)
 }
@@ -61,13 +61,15 @@ needs both `/internal/admin` and `/internal/admin/`, so a bait file's
 password leads somewhere.
 
 The API key is a customer key with the `trap` perm (`alice key make` prints
-one). `New` refuses a URL that isn't `http` or `https` with a host, and an
-empty key.
+one). `New` refuses an empty key. The handler forwards to Alice at
+`DefaultURL`, `https://alice.coragents.ai`; `WithURL` points it at another
+alice-srv (a self-hosted or local one).
 
 ## Options
 
 | Option | Default | What it does |
 | --- | --- | --- |
+| `WithURL(u)` | `DefaultURL`, `https://alice.coragents.ai` | The Alice server to forward to. `New` refuses a URL that isn't `http` or `https` with a host, or that has a query or fragment. |
 | `WithTimeout(d)` | `DefaultTimeout`, 2 s | The deadline of each trap exchange. `New` refuses one that isn't positive. |
 | `WithErrorHandler(fn)` | none | Calls `fn(r, err)` once for each fail-safe 404. |
 | `WithDroppedCookies(names...)` | none | Takes the named cookies out of what is forwarded: your own session, CSRF and remember-me cookies ([below](#your-own-cookies-and-headers)). `New` refuses an empty or invalid name, and `_vid`, Alice's agent cookie. |
@@ -77,7 +79,7 @@ empty key.
 | `WithTransport(rt)` | `http.DefaultTransport` | Sends the trap requests through your own `http.RoundTripper`. |
 
 ```go
-trap, err := aliceclient.New(aliceURL, apiKey,
+trap, err := aliceclient.New(apiKey,
 	aliceclient.WithTimeout(time.Second),
 	aliceclient.WithErrorHandler(func(r *http.Request, err error) {
 		logger.Warn("alice bait answered 404", "path", r.URL.Path, "error", err)
@@ -140,7 +142,7 @@ clientIP := func(r *http.Request) string {
 	return entries[len(entries)-trustedHops] // the Nth entry from the right
 }
 
-trap, err := aliceclient.New(aliceURL, apiKey, aliceclient.WithClientIP(clientIP))
+trap, err := aliceclient.New(apiKey, aliceclient.WithClientIP(clientIP))
 ```
 
 - **What it may return:** an IP address (`198.51.100.9`), or an address and

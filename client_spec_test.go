@@ -255,13 +255,32 @@ func TestSpec_Client_FailsSafeWithAPlain404(t *testing.T) {
 	}
 }
 
+func TestSpec_Client_ForwardsToTheDefaultAliceWithoutWithURL(t *testing.T) {
+	var got string
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		got = r.URL.String()
+		return nil, errors.New("not sent")
+	})
+	h, err := client.New(testAPIKey, client.WithTransport(transport))
+	if err != nil {
+		t.Fatalf("client.New: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/.envrc", nil)
+	req.RemoteAddr = "203.0.113.7:51234"
+
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	equal(t, "default URL", client.DefaultURL, "https://alice.coragents.ai")
+	equal(t, "trap URL", got, "https://alice.coragents.ai"+client.TrapPath)
+}
+
 func TestSpec_Client_RefusesABadConfiguration(t *testing.T) {
 	cases := []struct {
 		name     string
 		aliceURL string
 		apiKey   string
 	}{
-		{"no URL", "", testAPIKey},
+		{"an empty URL", "", testAPIKey},
 		{"a URL without a scheme", "alice.example", testAPIKey},
 		{"a URL of another scheme", "ftp://alice.example", testAPIKey},
 		{"a URL without a host", "http://", testAPIKey},
@@ -271,7 +290,7 @@ func TestSpec_Client_RefusesABadConfiguration(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := client.New(tc.aliceURL, tc.apiKey)
+			_, err := client.New(tc.apiKey, client.WithURL(tc.aliceURL))
 
 			equal(t, "refused", err != nil, true)
 		})
@@ -494,7 +513,7 @@ func TestSpec_Client_RefusesABadTimeoutOrProxyPrefix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := client.New("https://alice.example", testAPIKey, tc.opt)
+			_, err := client.New(testAPIKey, tc.opt)
 
 			if err == nil {
 				t.Fatal("not refused")
@@ -814,7 +833,7 @@ func TestSpec_Client_RefusesABadDrop(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := client.New("https://alice.example", testAPIKey, tc.opts...)
+			_, err := client.New(testAPIKey, tc.opts...)
 
 			if err == nil {
 				t.Fatal("not refused")
@@ -946,7 +965,7 @@ func TestSpec_Client_RefusesABadClientIPOption(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := client.New("https://alice.example", testAPIKey, tc.opts...)
+			_, err := client.New(testAPIKey, tc.opts...)
 
 			if err == nil {
 				t.Fatal("not refused")
@@ -956,7 +975,7 @@ func TestSpec_Client_RefusesABadClientIPOption(t *testing.T) {
 	}
 
 	t.Run("the control: WithClientIP alone", func(t *testing.T) {
-		_, err := client.New("https://alice.example", testAPIKey, client.WithClientIP(fn))
+		_, err := client.New(testAPIKey, client.WithClientIP(fn))
 		equal(t, "error", err, nil)
 	})
 }

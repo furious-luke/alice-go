@@ -67,7 +67,7 @@ func (a *defaultArranger) Proxy(trap *fakeTrap) *proxyActor {
 
 func (a *defaultArranger) ProxyTo(aliceURL string, opts ...client.Option) *proxyActor {
 	a.t.Helper()
-	h, err := client.New(aliceURL, testAPIKey, opts...)
+	h, err := client.New(testAPIKey, append([]client.Option{client.WithURL(aliceURL)}, opts...)...)
 	if err != nil {
 		a.t.Fatalf("client.New(%q): %v", aliceURL, err)
 	}
@@ -78,7 +78,7 @@ func (a *defaultArranger) ReportingProxy(aliceURL string, opts ...client.Option)
 	a.t.Helper()
 	p := &proxyActor{t: a.t}
 	opts = append(opts, client.WithErrorHandler(p.record))
-	h, err := client.New(aliceURL, testAPIKey, opts...)
+	h, err := client.New(testAPIKey, append([]client.Option{client.WithURL(aliceURL)}, opts...)...)
 	if err != nil {
 		a.t.Fatalf("client.New(%q): %v", aliceURL, err)
 	}

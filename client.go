@@ -23,6 +23,10 @@ import (
 	"time"
 )
 
+// DefaultURL is the Alice server a Handler forwards to, unless WithURL says
+// otherwise.
+const DefaultURL = "https://alice.coragents.ai"
+
 // TrapPath is the trap API's route on alice-srv.
 const TrapPath = "/api/trap"
 
@@ -62,6 +66,9 @@ var hopByHopHeaders = []string{
 // response. When Alice can't be reached in time, or answers without the
 // trap marker, it answers with a plain 404, as if the path weren't there.
 type Handler struct {
+	// aliceURL is the Alice server as given (DefaultURL or WithURL's);
+	// trapURL is the trap API on it, built by New.
+	aliceURL       string
 	trapURL        string
 	key            string
 	auth           string
@@ -86,6 +93,15 @@ type Handler struct {
 
 // Option configures a Handler.
 type Option func(*Handler)
+
+// WithURL forwards to the Alice server at aliceURL instead of DefaultURL:
+// a self-hosted or local alice-srv, say. New refuses a URL that isn't http
+// or https with a host, or that has a query or fragment.
+func WithURL(aliceURL string) Option {
+	return func(h *Handler) {
+		h.aliceURL = aliceURL
+	}
+}
 
 // WithTransport sends the trap requests through rt instead of
 // http.DefaultTransport. The handler calls rt.RoundTrip itself, so
@@ -247,29 +263,22 @@ func (e *Error) Unwrap() []error {
 	return []error{e.Reason, e.Err}
 }
 
-// New is a handler that forwards to the Alice server at aliceURL (for
-// example https://alice.example), authenticated by apiKey, a customer API
-// key with the trap perm. By default, requests reach Alice with the IP of
+// New is a handler that forwards to Alice (DefaultURL, unless WithURL
+// says otherwise), authenticated by apiKey, a customer API key with the
+// trap perm. By default, requests reach Alice with the IP of
 // their connection, taken from the request's RemoteAddr, so mount the
 // handler where RemoteAddr is the agent's IP (with or without a port),
 // list the site's proxies with WithTrustedProxies, or give the IP from the
 // site's own code with WithClientIP: a request from a unix-socket listener,
 // or one with no RemoteAddr and no IP from WithClientIP, is refused by
 // Alice and answered with a 404.
-func New(aliceURL, apiKey string, opts ...Option) (*Handler, error) {
-	base, err := url.Parse(aliceURL)
-	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
-		return nil, errors.New("alice client: the Alice URL must be an http or https URL with a host")
-	}
-	if base.RawQuery != "" || base.Fragment != "" {
-		return nil, errors.New("alice client: the Alice URL must not have a query or fragment")
-	}
+func New(apiKey string, opts ...Option) (*Handler, error) {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
 		return nil, errors.New("alice client: the API key is required")
 	}
 	h := &Handler{
-		trapURL:   base.JoinPath(TrapPath).String(),
+		aliceURL:  DefaultURL,
 		key:       apiKey,
 		auth:      "Token " + apiKey,
 		transport: http.DefaultTransport,
@@ -278,6 +287,14 @@ func New(aliceURL, apiKey string, opts ...Option) (*Handler, error) {
 	for _, opt := range opts {
 		opt(h)
 	}
+	base, err := url.Parse(h.aliceURL)
+	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
+		return nil, errors.New("alice client: the Alice URL must be an http or https URL with a host")
+	}
+	if base.RawQuery != "" || base.Fragment != "" {
+		return nil, errors.New("alice client: the Alice URL must not have a query or fragment")
+	}
+	h.trapURL = base.JoinPath(TrapPath).String()
 	if h.timeout <= 0 {
 		return nil, errors.New("alice client: the timeout must be positive")
 	}
