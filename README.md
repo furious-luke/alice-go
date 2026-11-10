@@ -36,6 +36,8 @@ empty key.
 | --- | --- | --- |
 | `WithTimeout(d)` | `DefaultTimeout`, 2 s | The deadline of each trap exchange. `New` refuses one that isn't positive. |
 | `WithErrorHandler(fn)` | none | Calls `fn(r, err)` once for each fail-safe 404. |
+| `WithDroppedCookies(names...)` | none | Takes the named cookies out of what is forwarded: your own session, CSRF and remember-me cookies ([below](#your-own-cookies-and-headers)). `New` refuses an empty or invalid name, and `_vid`, Alice's agent cookie. |
+| `WithDroppedHeaders(names...)` | none | Takes the named headers out of what is forwarded, in any case: identity headers your own proxy adds. `New` refuses an empty or invalid name, and `Authorization`, `Cookie` and `Host`. |
 | `WithTrustedProxies(prefixes...)` | none | Takes the client IP from `X-Forwarded-For` behind your own proxies. `New` refuses an invalid prefix, and an IPv4-mapped one (give `10.0.0.0/8`, not `::ffff:10.0.0.0/104`). |
 | `WithTransport(rt)` | `http.DefaultTransport` | Sends the trap requests through your own `http.RoundTripper`. |
 
@@ -46,8 +48,37 @@ trap, err := aliceclient.New(aliceURL, apiKey,
 		logger.Warn("alice bait answered 404", "path", r.URL.Path, "error", err)
 	}),
 	aliceclient.WithTrustedProxies(netip.MustParsePrefix("10.0.0.0/8")),
+	aliceclient.WithDroppedCookies("session", "csrf_token", "remember_me"),
+	aliceclient.WithDroppedHeaders("X-Auth-Request-Email"),
 )
 ```
+
+### Your own cookies and headers
+
+Everything the agent sends is forwarded to Alice and stored on its trail,
+cookies included. The bait paths are on your own domain, so a request to
+them also carries your site's own cookies: a logged-in member of staff who
+opens `/internal/admin` would hand Alice a live session. List them, and the
+client takes them out before anything is forwarded:
+
+- **Cookies** (`WithDroppedCookies`): your session cookie, your CSRF
+  cookie, your remember-me cookie, and any other cookie your site sets that
+  holds a credential. Names match exactly and case-sensitively, so a
+  `__Host-` or `__Secure-` prefix is part of the name (`__Host-session`);
+  there are no wildcards. Every `Cookie` line is read, and each pair named
+  as listed is removed. Every other pair is kept as the agent sent it,
+  malformed ones included, so the cookies an agent plants are still
+  captured. A line left with nothing is removed, and so is the header.
+- **Headers** (`WithDroppedHeaders`): any identity header a proxy in front
+  of your site adds, such as an auth proxy's `X-Auth-Request-Email` or
+  `X-Auth-Request-User`, or an internal session header. `Authorization`,
+  `Cookie` and `Host` can't be dropped: the maze's login needs
+  `Authorization`, `Cookie` carries Alice's agent cookie (`_vid`, exported
+  as `AgentCookieName`; list your own cookies instead), and the trap needs
+  `Host`.
+
+Either option can be given more than once; the lists add up. The agent's
+request itself is never changed, so the error handler sees it as received.
 
 ### The timeout
 
@@ -101,7 +132,8 @@ aliceclient.WithTrustedProxies(netip.MustParsePrefix("0.0.0.0/0"), netip.MustPar
 ## What it forwards and relays
 
 - **Forwarded:** the method, the path and query as received, the headers
-  (the `Host` header included, hop-by-hop headers left out), the body,
+  (the `Host` header included; hop-by-hop headers, and the cookies and
+  headers you drop, left out), the body,
   streamed, and the client IP, taken from the connection's `RemoteAddr`
   (or from `X-Forwarded-For` behind trusted proxies, above). Mount the
   handler where `RemoteAddr` is the agent's IP (with or without a port) or

@@ -34,6 +34,11 @@ const TrapContentType = "application/vnd.alice.trap"
 // A response without it (with the value "1") is never relayed.
 const TrapMarkerHeader = "Alice-Trap"
 
+// AgentCookieName is Alice's agent cookie: the maze sets it on the site's
+// domain, and it identifies the agent from one request to the next. It is
+// always forwarded: New refuses dropping it.
+const AgentCookieName = "_vid"
+
 // DefaultTimeout is how long a trap exchange may take, unless WithTimeout
 // says otherwise.
 const DefaultTimeout = 2 * time.Second
@@ -64,6 +69,13 @@ type Handler struct {
 	timeout        time.Duration
 	onError        func(*http.Request, error)
 	trustedProxies []netip.Prefix
+	// cookiesToDrop and headersToDrop are the names the options give, as
+	// given; droppedCookies and droppedHeaders are them checked by New, the
+	// header names in canonical form.
+	cookiesToDrop  []string
+	headersToDrop  []string
+	droppedCookies map[string]struct{}
+	droppedHeaders map[string]struct{}
 }
 
 // Option configures a Handler.
@@ -121,6 +133,43 @@ func WithTrustedProxies(prefixes ...netip.Prefix) Option {
 	return func(h *Handler) {
 		h.trustedProxies = append(h.trustedProxies, prefixes...)
 	}
+}
+
+// WithDroppedCookies takes the named cookies out of what is forwarded:
+// the site's own session, CSRF and remember-me cookies, which Alice has no
+// use for and should never hold. Names match exactly and case-sensitively,
+// a __Host- or __Secure- prefix included; there are no wildcards. Every
+// Cookie line is read, and each ;-separated pair whose name, trimmed of
+// spaces, is listed is removed, a bare listed name without = included.
+// Every other pair is kept byte for byte, malformed ones too. A line left
+// with no pair is removed, and so is the header when no line is left. The
+// agent's request itself is never changed. Given more than once, the
+// lists add up. New refuses an empty name, one that isn't a valid cookie
+// name, and AgentCookieName, which the maze needs.
+func WithDroppedCookies(names ...string) Option {
+	return func(h *Handler) {
+		h.cookiesToDrop = append(h.cookiesToDrop, names...)
+	}
+}
+
+// WithDroppedHeaders takes the named headers out of what is forwarded,
+// matched case-insensitively: identity headers the site's own proxy adds,
+// such as an auth proxy's X-Auth-Request-Email. The agent's request
+// itself is never changed. Given more than once, the lists add up. New
+// refuses an empty name, one that isn't a valid header name, and
+// Authorization (the maze's login), Cookie (it carries AgentCookieName:
+// drop the site's cookies with WithDroppedCookies) and Host.
+func WithDroppedHeaders(names ...string) Option {
+	return func(h *Handler) {
+		h.headersToDrop = append(h.headersToDrop, names...)
+	}
+}
+
+// keptHeaders are the headers WithDroppedHeaders can't drop, and why.
+var keptHeaders = map[string]string{
+	"Authorization": "the maze's login needs it",
+	"Cookie":        "it carries Alice's agent cookie; drop the site's cookies with WithDroppedCookies",
+	"Host":          "the trap needs it",
 }
 
 // The reasons the handler answers its fail-safe 404, matched with
@@ -217,7 +266,71 @@ func New(aliceURL, apiKey string, opts ...Option) (*Handler, error) {
 		}
 		h.trustedProxies[i] = p.Masked()
 	}
+	if err := h.checkDrops(); err != nil {
+		return nil, err
+	}
 	return h, nil
+}
+
+// checkDrops checks the names the drop options gave and makes the sets
+// the handler drops by.
+func (h *Handler) checkDrops() error {
+	for _, name := range h.cookiesToDrop {
+		switch {
+		case name == "":
+			return errors.New("alice client: a dropped cookie name is empty")
+		case !isToken(name):
+			return fmt.Errorf("alice client: the dropped cookie name %q isn't a valid cookie name", h.redact(name))
+		case name == AgentCookieName:
+			return fmt.Errorf("alice client: the cookie %s is Alice's agent cookie and can't be dropped", AgentCookieName)
+		}
+		if h.droppedCookies == nil {
+			h.droppedCookies = map[string]struct{}{}
+		}
+		h.droppedCookies[name] = struct{}{}
+	}
+	for _, name := range h.headersToDrop {
+		switch {
+		case name == "":
+			return errors.New("alice client: a dropped header name is empty")
+		case !isToken(name):
+			return fmt.Errorf("alice client: the dropped header name %q isn't a valid header name", h.redact(name))
+		}
+		canonical := textproto.CanonicalMIMEHeaderKey(name)
+		if why, kept := keptHeaders[canonical]; kept {
+			return fmt.Errorf("alice client: the %s header can't be dropped: %s", canonical, why)
+		}
+		if h.droppedHeaders == nil {
+			h.droppedHeaders = map[string]struct{}{}
+		}
+		h.droppedHeaders[canonical] = struct{}{}
+	}
+	return nil
+}
+
+// redact is s with the API key taken out, for an error that quotes what
+// the site configured.
+func (h *Handler) redact(s string) string {
+	return strings.ReplaceAll(s, h.key, "[redacted]")
+}
+
+// isToken is whether s is an RFC 9110 token, which both a header name and
+// an RFC 6265 cookie name are: one or more of the visible ASCII
+// characters other than the separators.
+func isToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // trapHead is the first line of a trap request: the forwarded request
@@ -399,6 +512,7 @@ func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 // reads it, nil for a request without one.
 func (h *Handler) trapRequest(ctx context.Context, r *http.Request) (trapReq *http.Request, body *agentBody, err error) {
 	header := withoutHopByHop(r.Header)
+	h.drop(header)
 	if r.Host != "" {
 		header.Set("Host", r.Host)
 	}
@@ -515,6 +629,73 @@ func remoteIP(remoteAddr string) string {
 		return remoteAddr
 	}
 	return host
+}
+
+// drop takes the dropped headers and cookies out of header, a copy of the
+// agent's. Names are matched in canonical form, so a header map built by
+// hand with a lower-case key is no way past it.
+func (h *Handler) drop(header http.Header) {
+	if len(h.droppedHeaders) == 0 && len(h.droppedCookies) == 0 {
+		return
+	}
+	for name, lines := range header {
+		canonical := textproto.CanonicalMIMEHeaderKey(name)
+		if _, dropped := h.droppedHeaders[canonical]; dropped {
+			delete(header, name)
+			continue
+		}
+		if canonical != "Cookie" || len(h.droppedCookies) == 0 {
+			continue
+		}
+		kept := make([]string, 0, len(lines))
+		for _, line := range lines {
+			if line, ok := h.dropCookies(line); ok {
+				kept = append(kept, line)
+			}
+		}
+		if len(kept) == 0 {
+			delete(header, name)
+		} else {
+			header[name] = kept
+		}
+	}
+}
+
+// dropCookies is the Cookie line without its dropped pairs, and false
+// when nothing but separators and spaces is left of a line that had one.
+// A line without a dropped pair is kept as it is. The pairs kept are
+// joined as they were, by ";"; when the line's first pair is dropped, the
+// spaces that followed its ";" go with it.
+func (h *Handler) dropCookies(line string) (string, bool) {
+	var (
+		out     strings.Builder
+		dropped bool
+		kept    int
+	)
+	for rest, more := line, true; more; {
+		var pair string
+		pair, rest, more = strings.Cut(rest, ";")
+		name, _, _ := strings.Cut(pair, "=")
+		if _, drop := h.droppedCookies[textproto.TrimString(name)]; drop {
+			dropped = true
+			continue
+		}
+		if kept > 0 {
+			out.WriteByte(';')
+		} else if dropped {
+			pair = strings.TrimLeft(pair, " \t")
+		}
+		out.WriteString(pair)
+		kept++
+	}
+	if !dropped {
+		return line, true
+	}
+	result := out.String()
+	if strings.Trim(result, " \t;") == "" {
+		return "", false
+	}
+	return result, true
 }
 
 // withoutHopByHop is a copy of header without its hop-by-hop headers: the

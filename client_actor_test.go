@@ -29,13 +29,15 @@ type proxyActor struct {
 // reported is one call of the error handler.
 type reported struct {
 	Path string
-	Err  error
+	// Header is the request's header as the error handler saw it.
+	Header http.Header
+	Err    error
 }
 
 func (p *proxyActor) record(r *http.Request, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.reported = append(p.reported, reported{Path: r.URL.Path, Err: err})
+	p.reported = append(p.reported, reported{Path: r.URL.Path, Header: r.Header.Clone(), Err: err})
 }
 
 // Reported is every call of the error handler so far.
@@ -54,6 +56,17 @@ func (p *proxyActor) MustReportOnce() error {
 		p.t.Fatalf("the error handler was called %d times, want once: %v", len(got), got)
 	}
 	return got[0].Err
+}
+
+// MustReportedOnce is the one call of the error handler; it fails the
+// spec unless there was exactly one.
+func (p *proxyActor) MustReportedOnce() reported {
+	p.t.Helper()
+	got := p.Reported()
+	if len(got) != 1 {
+		p.t.Fatalf("the error handler was called %d times, want once: %v", len(got), got)
+	}
+	return got[0]
 }
 
 // TimedServe is Serve, and how long the handler took.

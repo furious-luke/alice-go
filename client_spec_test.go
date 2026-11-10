@@ -2,6 +2,7 @@ package client_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -584,4 +585,242 @@ func withAgentGone(req *http.Request, gone bool) *http.Request {
 	ctx, cancel := context.WithCancel(req.Context())
 	cancel()
 	return req.WithContext(ctx)
+}
+
+func TestSpec_Client_TheAgentCookieIsVid(t *testing.T) {
+	equal(t, "agent cookie name", client.AgentCookieName, "_vid")
+}
+
+// The site's own cookie is taken out of the forwarded Cookie header, name
+// and value, and nothing of it is anywhere in the head; the agent's other
+// cookies, its credentials and Alice's agent cookie go through as sent.
+func TestSpec_Client_DropsTheSitesOwnCookie(t *testing.T) {
+	a := newArranger(t)
+	trap := a.TrapServer()
+	req := httptest.NewRequest(http.MethodGet, "/internal/admin", nil)
+	req.Header.Set("Cookie", "shop_session=staff-token-7f3a; planted=attacker-value-91; _vid=agent-cookie-id")
+	req.Header.Set("Authorization", "Basic YWRtaW46c2VjcmV0")
+
+	a.ProxyTo(trap.server.URL, client.WithDroppedCookies("shop_session")).Serve(req)
+
+	got := trap.MustLastRequest()
+	equal(t, "cookies", got.Head.Header.Values("Cookie"), []string{"planted=attacker-value-91; _vid=agent-cookie-id"})
+	equal(t, "authorization", got.Head.Header.Values("Authorization"), []string{"Basic YWRtaW46c2VjcmV0"})
+	head, err := json.Marshal(got.Head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	equal(t, "the head names the dropped cookie", strings.Contains(string(head), "shop_session"), false)
+	equal(t, "the head carries its value", strings.Contains(string(head), "staff-token-7f3a"), false)
+}
+
+// Edge and malformed Cookie input, with shop_session and __Host-csrf
+// dropped: every line is read, every pair named exactly as a dropped
+// cookie is removed, and everything else is kept byte for byte.
+func TestSpec_Client_DropsCookiesFromEveryShapeOfCookieHeader(t *testing.T) {
+	many := strings.Repeat("shop_session=t; planted=v; ", 20000)
+	cases := []struct {
+		name string
+		in   http.Header
+		// want is the forwarded header, less Host.
+		want http.Header
+	}{
+		{"several Cookie lines",
+			http.Header{"Cookie": {"shop_session=t1", "planted=v", "a=1; shop_session=t2"}},
+			http.Header{"Cookie": {"planted=v", "a=1"}}},
+		{"a pair with no =",
+			http.Header{"Cookie": {"flag; shop_session=t; other"}},
+			http.Header{"Cookie": {"flag; other"}}},
+		{"a dropped name with no =",
+			http.Header{"Cookie": {"shop_session; planted=v"}},
+			http.Header{"Cookie": {"planted=v"}}},
+		{"empty pairs",
+			http.Header{"Cookie": {"a=1;;shop_session=t;; b=2"}},
+			http.Header{"Cookie": {"a=1;;; b=2"}}},
+		{"a dropped name twice",
+			http.Header{"Cookie": {"shop_session=a; planted=v; shop_session=b"}},
+			http.Header{"Cookie": {"planted=v"}}},
+		{"names that differ only in case",
+			http.Header{"Cookie": {"Shop_Session=t; SHOP_SESSION=u; __host-csrf=c"}},
+			http.Header{"Cookie": {"Shop_Session=t; SHOP_SESSION=u; __host-csrf=c"}}},
+		{"a prefixed name, and another prefix",
+			http.Header{"Cookie": {"__Host-csrf=x; __Secure-csrf=y; csrf=z"}},
+			http.Header{"Cookie": {"__Secure-csrf=y; csrf=z"}}},
+		{"a quoted value",
+			http.Header{"Cookie": {`planted="a b"; shop_session="t"`}},
+			http.Header{"Cookie": {`planted="a b"`}}},
+		{"odd spacing",
+			http.Header{"Cookie": {"  planted=v ;  shop_session = t ;\tb=2  "}},
+			http.Header{"Cookie": {"  planted=v ;\tb=2  "}}},
+		{"the dropped name as a value",
+			http.Header{"Cookie": {"planted=shop_session"}},
+			http.Header{"Cookie": {"planted=shop_session"}}},
+		{"non-ASCII pairs",
+			http.Header{"Cookie": {"café=1; shop_session=t; ü=é"}},
+			http.Header{"Cookie": {"café=1; ü=é"}}},
+		{"a line that becomes empty",
+			http.Header{"Cookie": {"shop_session=t; ;", "planted=v"}},
+			http.Header{"Cookie": {"planted=v"}}},
+		{"every line becomes empty",
+			http.Header{"Cookie": {"shop_session=t", " __Host-csrf=c ;"}, "X-Kept": {"1"}},
+			http.Header{"X-Kept": {"1"}}},
+		{"a malformed line without a dropped pair",
+			http.Header{"Cookie": {"=; ;x", ""}},
+			http.Header{"Cookie": {"=; ;x", ""}}},
+		{"a header map keyed in lower case",
+			http.Header{"cookie": {"shop_session=t; a=1"}},
+			http.Header{"cookie": {"a=1"}}},
+		{"a long line",
+			http.Header{"Cookie": {many + "_vid=id"}},
+			http.Header{"Cookie": {strings.Repeat("planted=v; ", 20000) + "_vid=id"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newArranger(t)
+			trap := a.TrapServer()
+			req := httptest.NewRequest(http.MethodGet, "/.envrc", nil)
+			req.Header = tc.in
+
+			a.ProxyTo(trap.server.URL, client.WithDroppedCookies("shop_session", "__Host-csrf")).Serve(req)
+
+			got := trap.MustLastRequest().Head.Header
+			got.Del("Host")
+			equal(t, "header", got, tc.want)
+		})
+	}
+}
+
+// Each WithDroppedCookies and WithDroppedHeaders adds to the lists the
+// earlier ones gave.
+func TestSpec_Client_DropListsAddUp(t *testing.T) {
+	a := newArranger(t)
+	trap := a.TrapServer()
+	req := httptest.NewRequest(http.MethodGet, "/.envrc", nil)
+	req.Header = http.Header{
+		"Cookie":               {"one=1; two=2; three=3"},
+		"X-Auth-Request-Email": {"staff@shop.example"},
+		"X-Internal-Session":   {"s"},
+		"X-Kept":               {"yes"},
+	}
+
+	a.ProxyTo(trap.server.URL,
+		client.WithDroppedCookies("one"), client.WithDroppedCookies("three"),
+		client.WithDroppedHeaders("X-Auth-Request-Email"), client.WithDroppedHeaders("X-Internal-Session"),
+	).Serve(req)
+
+	got := trap.MustLastRequest().Head.Header
+	got.Del("Host")
+	equal(t, "header", got, http.Header{"Cookie": {"two=2"}, "X-Kept": {"yes"}})
+}
+
+// A dropped header is removed however its name is cased, in the option or
+// in the request; Authorization, the cookies and every header not listed
+// are forwarded as sent.
+func TestSpec_Client_DropsTheNamedHeadersInAnyCase(t *testing.T) {
+	cases := []struct {
+		name   string
+		option string
+		in     http.Header
+	}{
+		{"as given", "X-Auth-Request-Email", http.Header{"X-Auth-Request-Email": {"staff@shop.example"}}},
+		{"an option in another case", "x-AUTH-request-EMAIL", http.Header{"X-Auth-Request-Email": {"staff@shop.example"}}},
+		{"a header map keyed in lower case", "X-Auth-Request-Email", http.Header{"x-auth-request-email": {"staff@shop.example"}}},
+		{"several lines", "X-Auth-Request-Email", http.Header{"X-Auth-Request-Email": {"a@shop.example", "b@shop.example"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newArranger(t)
+			trap := a.TrapServer()
+			req := httptest.NewRequest(http.MethodGet, "/internal/admin", nil)
+			req.Header = tc.in.Clone()
+			req.Header["Authorization"] = []string{"Basic YWRtaW46c2VjcmV0"}
+			req.Header["Cookie"] = []string{"_vid=abc; planted=v"}
+			req.Header["X-Auth-Request-User"] = []string{"staff"}
+
+			a.ProxyTo(trap.server.URL, client.WithDroppedHeaders(tc.option)).Serve(req)
+
+			got := trap.MustLastRequest().Head.Header
+			got.Del("Host")
+			equal(t, "header", got, http.Header{
+				"Authorization":       {"Basic YWRtaW46c2VjcmV0"},
+				"Cookie":              {"_vid=abc; planted=v"},
+				"X-Auth-Request-User": {"staff"},
+			})
+		})
+	}
+}
+
+// The agent's request is never changed: after the handler, and in the
+// error handler, its headers are as received, dropped cookies and headers
+// included.
+func TestSpec_Client_LeavesTheAgentsRequestAsReceived(t *testing.T) {
+	received := http.Header{
+		"Cookie":               {"shop_session=t; planted=v", "shop_session=u"},
+		"X-Auth-Request-Email": {"staff@shop.example"},
+		"Authorization":        {"Basic YWRtaW46c2VjcmV0"},
+	}
+	drops := []client.Option{client.WithDroppedCookies("shop_session"), client.WithDroppedHeaders("X-Auth-Request-Email")}
+	t.Run("relayed", func(t *testing.T) {
+		a := newArranger(t)
+		trap := a.TrapServer()
+		req := httptest.NewRequest(http.MethodGet, "/.envrc", nil)
+		req.Header = received.Clone()
+
+		a.ProxyTo(trap.server.URL, drops...).Serve(req)
+
+		equal(t, "the request's header", req.Header, received)
+		equal(t, "forwarded cookies", trap.MustLastRequest().Head.Header.Values("Cookie"), []string{"planted=v"})
+	})
+	t.Run("failed safe", func(t *testing.T) {
+		a := newArranger(t)
+		proxy := a.ReportingProxy(a.UnreachableAlice(), drops...)
+		req := httptest.NewRequest(http.MethodGet, "/.envrc", nil)
+		req.Header = received.Clone()
+
+		proxy.Serve(req)
+
+		equal(t, "the header the error handler saw", proxy.MustReportedOnce().Header, received)
+		equal(t, "the request's header", req.Header, received)
+	})
+}
+
+// New refuses a drop it can't honour, each with an error saying what is
+// wrong and never the API key.
+func TestSpec_Client_RefusesABadDrop(t *testing.T) {
+	cases := []struct {
+		name string
+		opts []client.Option
+		// says is part of the error's text.
+		says string
+	}{
+		{"an empty cookie name", []client.Option{client.WithDroppedCookies("")}, "cookie name is empty"},
+		{"a cookie name with a space", []client.Option{client.WithDroppedCookies("shop session")}, "isn't a valid cookie name"},
+		{"a cookie name with =", []client.Option{client.WithDroppedCookies("shop=session")}, "isn't a valid cookie name"},
+		{"a cookie name with ;", []client.Option{client.WithDroppedCookies("a;b")}, "isn't a valid cookie name"},
+		{"a non-ASCII cookie name", []client.Option{client.WithDroppedCookies("café")}, "isn't a valid cookie name"},
+		{"a cookie name carrying the key", []client.Option{client.WithDroppedCookies(testAPIKey + " x")}, "isn't a valid cookie name"},
+		{"the agent cookie", []client.Option{client.WithDroppedCookies("shop_session", "_vid")}, "_vid is Alice's agent cookie"},
+		{"the agent cookie in a later option", []client.Option{client.WithDroppedCookies("a"), client.WithDroppedCookies("_vid")}, "_vid is Alice's agent cookie"},
+		{"an empty header name", []client.Option{client.WithDroppedHeaders("")}, "header name is empty"},
+		{"a header name with a space", []client.Option{client.WithDroppedHeaders("X Auth")}, "isn't a valid header name"},
+		{"a header name with :", []client.Option{client.WithDroppedHeaders("X-Auth:")}, "isn't a valid header name"},
+		{"a header name carrying the key", []client.Option{client.WithDroppedHeaders(testAPIKey + ":")}, "isn't a valid header name"},
+		{"Authorization", []client.Option{client.WithDroppedHeaders("Authorization")}, "Authorization header can't be dropped"},
+		{"authorization", []client.Option{client.WithDroppedHeaders("authorization")}, "Authorization header can't be dropped"},
+		{"Cookie", []client.Option{client.WithDroppedHeaders("Cookie")}, "Cookie header can't be dropped"},
+		{"COOKIE", []client.Option{client.WithDroppedHeaders("X-Ok", "COOKIE")}, "Cookie header can't be dropped"},
+		{"Host", []client.Option{client.WithDroppedHeaders("Host")}, "Host header can't be dropped"},
+		{"host", []client.Option{client.WithDroppedHeaders("host")}, "Host header can't be dropped"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := client.New("https://alice.example", testAPIKey, tc.opts...)
+
+			if err == nil {
+				t.Fatal("not refused")
+			}
+			equal(t, "error says "+tc.says, strings.Contains(err.Error(), tc.says), true)
+			equal(t, "error carries the key", strings.Contains(err.Error(), testAPIKey), false)
+		})
+	}
 }
