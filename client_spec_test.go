@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/furious-luke/go-projects/alice/client"
+	client "github.com/furious-luke/alice-go"
 )
 
 func TestSpec_Client_ForwardsTheRequestUnchanged(t *testing.T) {

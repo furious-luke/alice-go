@@ -6,13 +6,31 @@ response Alice decides is relayed back, so a hacking agent only ever sees
 the site's own domain. It is its own module and uses the standard library
 only, so adding it brings in no other dependencies.
 
-Design: the trap protocol and what the client does with it are in
-[../designs/trap.md](../designs/trap.md).
+```sh
+go get github.com/furious-luke/alice-go
+```
+
+```go
+import aliceclient "github.com/furious-luke/alice-go"
+```
+
+The package is named `client`; the samples here import it as `aliceclient`.
+
+The module is developed in Alice's monorepo, at `alice/client`, and released
+from it to [github.com/furious-luke/alice-go](https://github.com/furious-luke/alice-go)
+(see "Releasing the client" in Alice's README). Make changes in the
+monorepo, not in the public repo: a release pushes `alice/client`'s own
+history, split out of the monorepo, so a commit made only in the public
+repo would be overwritten or block the next release.
+
+Design: the trap protocol and what the client does with it are in Alice's
+`designs/trap.md`, in the monorepo ([../designs/trap.md](../designs/trap.md)
+from there).
 
 ## Mounting it
 
 ```go
-import aliceclient "github.com/furious-luke/go-projects/alice/client"
+import aliceclient "github.com/furious-luke/alice-go"
 
 trap, err := aliceclient.New("https://alice.example", os.Getenv("ALICE_API_KEY"))
 if err != nil {

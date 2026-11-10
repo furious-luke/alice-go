@@ -11,7 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/furious-luke/go-projects/alice/client"
+	client "github.com/furious-luke/alice-go"
 )
 
 // arranger builds the worlds the client's specs run in: a fake trap server

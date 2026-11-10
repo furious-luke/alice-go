@@ -1,3 +1,3 @@
-module github.com/furious-luke/go-projects/alice/client
+module github.com/furious-luke/alice-go
 
 go 1.25.0
