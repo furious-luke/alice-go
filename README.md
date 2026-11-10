@@ -42,6 +42,10 @@ mux.Handle("/.envrc", trap)
 mux.Handle("/.env", trap)
 mux.Handle("/.env.local", trap)
 mux.Handle("/.env.production", trap)
+mux.Handle("/.git/config", trap)
+mux.Handle("/wp-login.php", trap)
+mux.Handle("/phpinfo.php", trap)
+mux.Handle("/info.php", trap)
 mux.Handle("/internal/admin", trap)
 mux.Handle("/internal/admin/", trap)
 mux.HandleFunc("GET /api/products", products) // the site's real routes
@@ -53,6 +57,9 @@ These are the bait paths, and Alice answers each of them:
 | --- | --- |
 | `/.envrc` | A direnv file (`export KEY=value` lines) leaking the fake admin's URL and a password of the agent's own. |
 | `/.env`, `/.env.local`, `/.env.production` | The same values as a dotenv file (`KEY=value` lines), the same password included. |
+| `/.git/config` | An exposed git config whose remote URL carries the same password. |
+| `/wp-login.php` | A WordPress login page with a stale comment giving the admin's URL and the same password. |
+| `/phpinfo.php`, `/info.php` | A `phpinfo()` page whose environment shows the admin's URL and the same password. |
 | `/internal/admin`, `/internal/admin/` and below | The fake admin, behind the leaked password. |
 
 Mount only the ones your site doesn't serve itself: a path you serve for
