@@ -18,6 +18,7 @@ import (
 	"net/netip"
 	"net/textproto"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -432,6 +433,14 @@ func (h *Handler) serve(w *trackingWriter, r *http.Request) {
 		header[name] = values
 	}
 	header.Del(TrapMarkerHeader)
+	// A known length is relayed as the answer's Content-Length, so the
+	// site's own server frames it as it frames its own pages, rather than
+	// chunking anything over its buffer. A HEAD keeps the length, as the
+	// site's server sends it for its own pages, and gets no body.
+	header.Del("Content-Length")
+	if res.ContentLength >= 0 && bodyAllowed(res.StatusCode) {
+		header.Set("Content-Length", strconv.FormatInt(res.ContentLength, 10))
+	}
 	w.WriteHeader(res.StatusCode)
 	// A failure here (the deadline included) is past the point where the
 	// agent could be told anything else: the status is already sent.
@@ -776,6 +785,12 @@ func (h *Handler) dropCookies(line string) (string, bool) {
 		return "", false
 	}
 	return result, true
+}
+
+// bodyAllowed is whether a response with the status may carry a body (and
+// so a Content-Length): not a 1xx, a 204 or a 304.
+func bodyAllowed(status int) bool {
+	return status >= 200 && status != http.StatusNoContent && status != http.StatusNotModified
 }
 
 // withoutHopByHop is a copy of header without its hop-by-hop headers: the

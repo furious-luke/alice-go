@@ -164,6 +164,53 @@ func TestSpec_Client_StripsHopByHopResponseHeaders(t *testing.T) {
 	})
 }
 
+// A relayed answer whose length Alice states is framed by the site's own
+// server with that Content-Length, whatever its size, as the site frames
+// its own pages: never chunked. One whose length isn't known still relays
+// its whole body. A HEAD states the length a GET has and relays no body;
+// a 204 relays neither.
+func TestSpec_Client_FramesARelayedAnswerWithItsLength(t *testing.T) {
+	large := strings.Repeat("<p>a page well over the server's buffer</p>\n", 400)
+	cases := []struct {
+		name          string
+		method        string
+		status        int
+		header        http.Header
+		body          string
+		wantLength    int64
+		wantBody      string
+		wantNoChunked bool
+	}{
+		{"a large page of known length", http.MethodGet, http.StatusOK, http.Header{"Content-Length": {strconv.Itoa(len(large))}}, large, int64(len(large)), large, true},
+		{"a small answer of known length", http.MethodPost, http.StatusUnprocessableEntity, http.Header{"Content-Length": {"2"}}, "{}", 2, "{}", true},
+		{"a large page of unknown length", http.MethodGet, http.StatusOK, nil, large, -1, large, false},
+		{"a HEAD, with the length a GET has", http.MethodHead, http.StatusOK, http.Header{"Content-Length": {strconv.Itoa(len(large))}}, large, int64(len(large)), "", true},
+		{"a 204", http.MethodGet, http.StatusNoContent, nil, "", -2, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newArranger(t)
+			trap := a.TrapServer()
+			header := http.Header{"Content-Type": {"text/html; charset=utf-8"}}
+			for name, values := range tc.header {
+				header[name] = values
+			}
+			trap.AnswersWith(trapResponse{Status: tc.status, Header: header, Body: tc.body, Marker: "1"})
+
+			res := a.Agent(a.Proxy(trap)).MustFetch(tc.method, "/internal/admin/payroll")
+
+			equal(t, "status", res.Status, tc.status)
+			equal(t, "body", res.Body, tc.wantBody)
+			if tc.wantNoChunked {
+				equal(t, "transfer encoding", len(res.TransferEncoding), 0)
+			}
+			if tc.wantLength >= -1 {
+				equal(t, "content length", res.ContentLength, tc.wantLength)
+			}
+		})
+	}
+}
+
 func TestSpec_Client_RelaysARedirectWithoutFollowingIt(t *testing.T) {
 	a := newArranger(t)
 	trap := a.TrapServer()

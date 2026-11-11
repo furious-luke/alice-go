@@ -97,6 +97,38 @@ type agentActor struct {
 	url string
 }
 
+// framed is an answer as it came over the wire from the site's server: its
+// status, its length as framed (-1 when it had none), how it was
+// transfer-encoded, and its body.
+type framed struct {
+	Status           int
+	ContentLength    int64
+	TransferEncoding []string
+	Body             string
+}
+
+// MustFetch sends method path to the site's server, and is how the answer
+// was framed on the wire.
+func (a *agentActor) MustFetch(method, path string) framed {
+	a.t.Helper()
+	req, err := http.NewRequest(method, a.url+path, nil)
+	if err != nil {
+		a.t.Fatalf("new request: %v", err)
+	}
+	// No transparent gzip: the answer is read as it was framed.
+	req.Header.Set("Accept-Encoding", "identity")
+	res, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		a.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		a.t.Fatalf("%s %s: read the body: %v", method, path, err)
+	}
+	return framed{Status: res.StatusCode, ContentLength: res.ContentLength, TransferEncoding: res.TransferEncoding, Body: string(body)}
+}
+
 // upload is what an agent sent in a streamed upload, and what it got back.
 type upload struct {
 	Status   int
