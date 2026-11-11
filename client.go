@@ -442,6 +442,13 @@ func (h *Handler) serve(w *trackingWriter, r *http.Request) {
 		header.Set("Content-Length", strconv.FormatInt(res.ContentLength, 10))
 	}
 	w.WriteHeader(res.StatusCode)
+	if r.Method == http.MethodHead {
+		// Alice answers a HEAD as its GET, body and all, so its length is
+		// known; the agent gets no body. It is drained so the connection
+		// can be reused.
+		_, _ = io.Copy(io.Discard, res.Body)
+		return
+	}
 	// A failure here (the deadline included) is past the point where the
 	// agent could be told anything else: the status is already sent.
 	_, _ = io.Copy(w, res.Body)
