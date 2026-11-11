@@ -231,6 +231,10 @@ func TestSpec_Client_FailsSafeWithAPlain404(t *testing.T) {
 			proxy: answering(trapResponse{Status: http.StatusInternalServerError, Body: refusal}),
 		},
 		{
+			name:  "a client-closed 499 without the marker",
+			proxy: answering(trapResponse{Status: 499, Body: refusal}),
+		},
+		{
 			name:  "a marker with another value",
 			proxy: answering(trapResponse{Status: http.StatusOK, Body: refusal, Marker: "0"}),
 		},
@@ -391,6 +395,8 @@ func TestSpec_Client_ReportsWhyItFailedSafe(t *testing.T) {
 		{name: "Alice hung", alice: arranger.HungAlice, opts: []client.Option{client.WithTimeout(100 * time.Millisecond)}, reason: client.ErrTimeout},
 		{name: "a 200 without the marker", alice: answeringAt(trapResponse{Status: http.StatusOK}), reason: client.ErrNoMarker, status: http.StatusOK},
 		{name: "a 401 without the marker", alice: answeringAt(trapResponse{Status: http.StatusUnauthorized}), reason: client.ErrNoMarker, status: http.StatusUnauthorized},
+		{name: "a 499 without the marker", alice: answeringAt(trapResponse{Status: 499}), reason: client.ErrNoMarker, status: 499},
+		{name: "a 500 without the marker", alice: answeringAt(trapResponse{Status: http.StatusInternalServerError}), reason: client.ErrNoMarker, status: http.StatusInternalServerError},
 		{name: "a marker with another value", alice: answeringAt(trapResponse{Status: http.StatusOK, Marker: "0"}), reason: client.ErrNoMarker, status: http.StatusOK},
 		{name: "the agent's body failing", alice: answeringAt(trapResponse{Status: http.StatusOK, Marker: "1"}), body: closedBody{}, reason: client.ErrRequest},
 		{name: "the agent's body panicking", alice: answeringAt(trapResponse{Status: http.StatusOK, Marker: "1"}), body: io.NopCloser(&panickingReader{}), reason: client.ErrRequest},

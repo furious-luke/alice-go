@@ -58,10 +58,11 @@ These are the bait paths, and Alice answers each of them:
 | `/.envrc` | A direnv file (`export KEY=value` lines) leaking the fake admin's URL and a password of the agent's own. |
 | `/.env`, `/.env.local`, `/.env.production` | The same values as a dotenv file (`KEY=value` lines), the same password included. |
 | `/.git/config` | An exposed git config whose remote URL carries the same password. |
-| `/wp-login.php` | A WordPress login page with a stale comment giving the admin's URL and the same password. |
+| `/wp-login.php` | A WordPress login page with a stale comment giving the admin's URL and the same password. A POST of its form gets the page back with a wrong-password error. |
 | `/phpinfo.php`, `/info.php` | A `phpinfo()` page whose environment shows the admin's URL and the same password. |
 | `/internal/admin`, `/internal/admin/` and below | The fake admin, behind the leaked password. |
 
+Mount each for every method, as above: the login page's form posts to it.
 Mount only the ones your site doesn't serve itself: a path you serve for
 real stays yours, and a path you don't mount just isn't bait. The admin
 needs both `/internal/admin` and `/internal/admin/`, so a bait file's
