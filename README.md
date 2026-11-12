@@ -46,6 +46,10 @@ mux.Handle("/.git/config", trap)
 mux.Handle("/wp-login.php", trap)
 mux.Handle("/phpinfo.php", trap)
 mux.Handle("/info.php", trap)
+mux.Handle("/openapi.json", trap)
+mux.Handle("/swagger.json", trap)
+mux.Handle("/api-docs", trap)
+mux.Handle("/v3/api-docs", trap)
 mux.Handle("/internal/admin", trap)
 mux.Handle("/internal/admin/", trap)
 mux.HandleFunc("GET /api/products", products) // the site's real routes
@@ -56,11 +60,17 @@ These are the bait paths, and Alice answers each of them:
 | Path | Alice's answer |
 | --- | --- |
 | `/.envrc` | A direnv file (`export KEY=value` lines) leaking the fake admin's URL and a password of the agent's own. |
-| `/.env`, `/.env.local`, `/.env.production` | The same values as a dotenv file (`KEY=value` lines), the same password included. |
+| `/.env`, `/.env.local`, `/.env.production` | Dotenv files (`KEY=value` lines), each a different variant (production, local, production overrides) with fake third-party settings, the same admin URL and password included. |
 | `/.git/config` | An exposed git config whose remote URL carries the same password. |
 | `/wp-login.php` | A WordPress login page with a stale comment giving the admin's URL and the same password. A POST of its form gets the page back with a wrong-password error. |
 | `/phpinfo.php`, `/info.php` | A `phpinfo()` page whose environment shows the admin's URL and the same password. |
+| `/openapi.json`, `/swagger.json`, `/api-docs`, `/v3/api-docs` | An OpenAPI document of your internal API listing the admin, whose example `Authorization` header is the same credentials. |
 | `/internal/admin`, `/internal/admin/` and below | The fake admin, behind the leaked password. |
+
+What each says (your product's name, your stack's variables, the admin's
+routes) comes from your account's persona, which you set with `alice
+persona set`; the PHP pages answer only when your persona's stack is PHP,
+and are a plain 404 otherwise, so you can mount them whatever your stack.
 
 Mount each for every method, as above: the login page's form posts to it.
 Mount only the ones your site doesn't serve itself: a path you serve for
@@ -72,6 +82,18 @@ The API key is a customer key with the `trap` perm (`alice key make` prints
 one). `New` refuses an empty key. The handler forwards to Alice at
 `DefaultURL`, `https://alice.coragents.ai`; `WithURL` points it at another
 alice-srv (a self-hosted or local one).
+
+### Breadcrumbs on your own pages
+
+Agents that explore a site read what scanners skip. Your own pages can
+point at the admin too, with nothing of Alice's in them:
+
+- `robots.txt`: `Disallow: /internal/admin`.
+- An HTML comment in your app's shell, such as
+  `<!-- ops: /internal/admin (see .env.local) -->`.
+
+Neither leaks a password: they lead an agent to the admin's login and to
+the bait files that do.
 
 ## Options
 
