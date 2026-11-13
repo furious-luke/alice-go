@@ -52,6 +52,8 @@ mux.Handle("/api-docs", trap)
 mux.Handle("/v3/api-docs", trap)
 mux.Handle("/internal/admin", trap)
 mux.Handle("/internal/admin/", trap)
+mux.Handle("/internal/api", trap)
+mux.Handle("/internal/api/", trap)
 mux.HandleFunc("GET /api/products", products) // the site's real routes
 ```
 
@@ -64,8 +66,9 @@ These are the bait paths, and Alice answers each of them:
 | `/.git/config` | An exposed git config whose remote URL carries the same password. |
 | `/wp-login.php` | A WordPress login page with a stale comment giving the admin's URL and the same password. A POST of its form gets the page back with a wrong-password error. |
 | `/phpinfo.php`, `/info.php` | A `phpinfo()` page whose environment shows the admin's URL and the same password. |
-| `/openapi.json`, `/swagger.json`, `/api-docs`, `/v3/api-docs` | An OpenAPI document of your internal API listing the admin, whose example `Authorization` header is the same credentials. |
-| `/internal/admin`, `/internal/admin/` and below | The fake admin, behind the leaked password. |
+| `/openapi.json`, `/swagger.json`, `/api-docs`, `/v3/api-docs` | An OpenAPI document of your product's API: a join that hands out a bearer token, the operations that token opens, and, marked staff-only, an elevate operation and the admin's routes. It carries no credentials. |
+| `/internal/admin`, `/internal/admin/` and below | The fake admin, behind the leaked password or an elevated token. |
+| `/internal/api`, `/internal/api/` and below | The API the OpenAPI document describes: join, the joined session's operations, and elevate. |
 
 What each says (your product's name, your stack's variables, the admin's
 routes) comes from your account's persona, which you set with `alice
@@ -76,7 +79,8 @@ Mount each for every method, as above: the login page's form posts to it.
 Mount only the ones your site doesn't serve itself: a path you serve for
 real stays yours, and a path you don't mount just isn't bait. The admin
 needs both `/internal/admin` and `/internal/admin/`, so a bait file's
-password leads somewhere.
+password leads somewhere, and the API both `/internal/api` and
+`/internal/api/`, so the OpenAPI document's operations answer.
 
 The API key is a customer key with the `trap` perm (`alice key make` prints
 one). `New` refuses an empty key. The handler forwards to Alice at
