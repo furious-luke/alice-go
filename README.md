@@ -90,7 +90,7 @@ one). `New` refuses an empty key. The handler forwards to Alice at
 `DefaultURL`, `https://alice.coragents.ai`; `WithURL` points it at another
 alice-srv (a self-hosted or local one).
 
-### Optional Git clone route
+### Optional Git repository route
 
 Create your handler with `aliceclient.WithGitBaitOrigin("https://shop.example")`
 and mount `aliceclient.GitRepositoryPath` and `aliceclient.GitRepositoryPath + "/"`
@@ -98,7 +98,8 @@ alongside the Git discovery paths. Use the target's public origin, including
 its port when the request carries one. `/.git/config` advertises the clone URL
 on that origin and supplies the same synthetic credential as the admin bait.
 The Git remote serves an embedded repository over read-only HTTP and requires
-that credential.
+that credential. Open the same path in a browser to navigate the `main` and
+`archive/pre-sso` branches with the same credential.
 
 ### Breadcrumbs on your own pages
 
