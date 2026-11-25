@@ -31,6 +31,9 @@ const DefaultURL = "https://alice.coragents.ai"
 // TrapPath is the trap API's route on alice-srv.
 const TrapPath = "/api/trap"
 
+// GitRepositoryPath is the optional synthetic repository to mount on the target.
+const GitRepositoryPath = "/internal/git/sessions-gateway.git"
+
 // TrapContentType is the trap request's content type: a JSON head line,
 // then the forwarded body.
 const TrapContentType = "application/vnd.alice.trap"
@@ -77,6 +80,8 @@ type Handler struct {
 	timeout        time.Duration
 	onError        func(*http.Request, error)
 	trustedProxies []netip.Prefix
+	gitBaitOrigin  string
+	gitBaitHost    string
 	// trustsProxies and hasClientIP are whether WithTrustedProxies and
 	// WithClientIP were given, so New can refuse both together even when
 	// the prefixes are none or the function is nil.
@@ -102,6 +107,13 @@ func WithURL(aliceURL string) Option {
 	return func(h *Handler) {
 		h.aliceURL = aliceURL
 	}
+}
+
+// WithGitBaitOrigin enables the synthetic Git repository on the configured
+// target origin. Mount GitRepositoryPath and its subtree on this handler to
+// serve the remote advertised by /.git/config. An empty origin disables it.
+func WithGitBaitOrigin(origin string) Option {
+	return func(h *Handler) { h.gitBaitOrigin = origin }
 }
 
 // WithTransport sends the trap requests through rt instead of
@@ -296,6 +308,15 @@ func New(apiKey string, opts ...Option) (*Handler, error) {
 		return nil, errors.New("alice client: the Alice URL must not have a query or fragment")
 	}
 	h.trapURL = base.JoinPath(TrapPath).String()
+	if h.gitBaitOrigin != "" {
+		origin, err := url.Parse(h.gitBaitOrigin)
+		if err != nil || (origin.Scheme != "http" && origin.Scheme != "https") || origin.Hostname() == "" || origin.User != nil ||
+			(origin.EscapedPath() != "" && origin.EscapedPath() != "/") || strings.ContainsAny(h.gitBaitOrigin, "?#") {
+			return nil, errors.New("alice client: the Git bait origin must be an http or https origin")
+		}
+		h.gitBaitHost = origin.Host
+		h.gitBaitOrigin = origin.Scheme + "://" + origin.Host
+	}
 	if h.timeout <= 0 {
 		return nil, errors.New("alice client: the timeout must be positive")
 	}
@@ -386,10 +407,11 @@ func isToken(s string) bool {
 // trapHead is the first line of a trap request: the forwarded request
 // without its body.
 type trapHead struct {
-	Method   string      `json:"method"`
-	Target   string      `json:"target"`
-	Header   http.Header `json:"header"`
-	ClientIP string      `json:"client_ip"`
+	Method        string      `json:"method"`
+	Target        string      `json:"target"`
+	Header        http.Header `json:"header"`
+	ClientIP      string      `json:"client_ip"`
+	GitBaitOrigin string      `json:"git_bait_origin,omitempty"`
 }
 
 // ServeHTTP forwards r to the trap API and relays the response. No panic
@@ -581,12 +603,16 @@ func (h *Handler) trapRequest(ctx context.Context, r *http.Request) (trapReq *ht
 	if r.Host != "" {
 		header.Set("Host", r.Host)
 	}
-	head, err := json.Marshal(trapHead{
+	forwarded := trapHead{
 		Method:   r.Method,
 		Target:   requestTarget(r),
 		Header:   header,
 		ClientIP: h.clientIP(r),
-	})
+	}
+	if h.gitBaitHost != "" && strings.EqualFold(r.Host, h.gitBaitHost) {
+		forwarded.GitBaitOrigin = h.gitBaitOrigin
+	}
+	head, err := json.Marshal(forwarded)
 	if err != nil {
 		return nil, nil, err
 	}

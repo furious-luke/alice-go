@@ -90,6 +90,16 @@ one). `New` refuses an empty key. The handler forwards to Alice at
 `DefaultURL`, `https://alice.coragents.ai`; `WithURL` points it at another
 alice-srv (a self-hosted or local one).
 
+### Optional Git clone route
+
+Create your handler with `aliceclient.WithGitBaitOrigin("https://shop.example")`
+and mount `aliceclient.GitRepositoryPath` and `aliceclient.GitRepositoryPath + "/"`
+alongside the Git discovery paths. Use the target's public origin, including
+its port when the request carries one. `/.git/config` advertises the clone URL
+on that origin and supplies the same synthetic credential as the admin bait.
+The Git remote serves an embedded repository over read-only HTTP and requires
+that credential.
+
 ### Breadcrumbs on your own pages
 
 Agents that explore a site read what scanners skip. Your own pages can
@@ -107,6 +117,7 @@ the bait files that do.
 | Option | Default | What it does |
 | --- | --- | --- |
 | `WithURL(u)` | `DefaultURL`, `https://alice.coragents.ai` | The Alice server to forward to. `New` refuses a URL that isn't `http` or `https` with a host, or that has a query or fragment. |
+| `WithGitBaitOrigin(u)` | empty | Opts in to the read-only Git remote and advertises its URL to visitors on the configured target origin. Supply an `http` or `https` scheme and authority, with an optional trailing `/`. |
 | `WithTimeout(d)` | `DefaultTimeout`, 2 s | The deadline of each trap exchange. `New` refuses one that isn't positive. |
 | `WithErrorHandler(fn)` | none | Calls `fn(r, err)` once for each fail-safe 404. |
 | `WithDroppedCookies(names...)` | none | Takes the named cookies out of what is forwarded: your own session, CSRF and remember-me cookies ([below](#your-own-cookies-and-headers)). `New` refuses an empty or invalid name, and `_vid`, Alice's agent cookie. |

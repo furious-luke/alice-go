@@ -45,6 +45,33 @@ func TestSpec_Client_ForwardsTheRequestUnchanged(t *testing.T) {
 	equal(t, "body", got.Body, `{"amount":100}`)
 }
 
+func TestSpec_Client_ForwardsGitBaitOptInOnlyToTheConfiguredHost(t *testing.T) {
+	a := newArranger(t)
+	trap := a.TrapServer()
+	for _, tc := range []struct{ host, configured, forwarded string }{
+		{"shop.example", "https://Shop.Example/", "https://Shop.Example"},
+		{"other.example", "https://shop.example", ""},
+		{"shop.example", "https://shop.example:8443", ""},
+		{"shop.example", "", ""},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/.git/config", nil)
+		req.Host = tc.host
+		req.Header.Set("Git-Bait-Origin", "https://untrusted.example")
+		req.Header.Set("X-Forwarded-Host", "shop.example")
+		a.ProxyTo(trap.server.URL, client.WithGitBaitOrigin(tc.configured)).Serve(req)
+		equal(t, "Git bait origin", trap.MustLastRequest().Head.GitBaitOrigin, tc.forwarded)
+	}
+}
+
+func TestSpec_Client_RejectsGitBaitOriginWithCredentialsOrAPath(t *testing.T) {
+	for _, origin := range []string{"ftp://shop.example", "https://", "https://name@shop.example/", "https://shop.example/different", "https://shop.example?", "https://shop.example#"} {
+		_, err := client.New("key", client.WithGitBaitOrigin(origin))
+		if err == nil {
+			t.Errorf("origin %q was accepted", origin)
+		}
+	}
+}
+
 func TestSpec_Client_SpeaksTheTrapProtocol(t *testing.T) {
 	a := newArranger(t)
 	trap := a.TrapServer()

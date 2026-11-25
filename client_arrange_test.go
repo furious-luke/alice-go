@@ -143,10 +143,11 @@ type trapResponse struct {
 
 // trapHead is the head line of a trap request, as the fake decodes it.
 type trapHead struct {
-	Method   string      `json:"method"`
-	Target   string      `json:"target"`
-	Header   http.Header `json:"header"`
-	ClientIP string      `json:"client_ip"`
+	Method        string      `json:"method"`
+	Target        string      `json:"target"`
+	Header        http.Header `json:"header"`
+	ClientIP      string      `json:"client_ip"`
+	GitBaitOrigin string      `json:"git_bait_origin"`
 }
 
 // trapRequest is one trap request as the fake trap server received it.
