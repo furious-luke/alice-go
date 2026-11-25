@@ -43,6 +43,8 @@ mux.Handle("/.env", trap)
 mux.Handle("/.env.local", trap)
 mux.Handle("/.env.production", trap)
 mux.Handle("/.git/config", trap)
+mux.Handle("/.git/HEAD", trap)
+mux.Handle("/.git/info/refs", trap)
 mux.Handle("/wp-login.php", trap)
 mux.Handle("/phpinfo.php", trap)
 mux.Handle("/info.php", trap)
@@ -64,6 +66,7 @@ These are the bait paths, and Alice answers each of them:
 | `/.envrc` | A direnv file (`export KEY=value` lines) leaking the fake admin's URL and a password of the agent's own. |
 | `/.env`, `/.env.local`, `/.env.production` | Dotenv files (`KEY=value` lines), each a different variant (production, local, production overrides) with fake third-party settings, the same admin URL and password included. |
 | `/.git/config` | An exposed git config whose remote URL carries the same password. |
+| `/.git/HEAD`, `/.git/info/refs` | The default branch and refs of the same synthetic Git snapshot. |
 | `/wp-login.php` | A WordPress login page with a stale comment giving the admin's URL and the same password. A POST of its form gets the page back with a wrong-password error. |
 | `/phpinfo.php`, `/info.php` | A `phpinfo()` page whose environment shows the admin's URL and the same password. |
 | `/openapi.json`, `/swagger.json`, `/api-docs`, `/v3/api-docs` | An OpenAPI document of your product's API: a join that hands out a bearer token, the operations that token opens, and, marked staff-only, an elevate operation and the admin's routes. It carries no credentials. |
